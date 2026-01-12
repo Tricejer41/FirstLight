@@ -1,0 +1,12 @@
+# Example knobs for N1 (hostless fast-risers)
+n1:
+  drb_min: 0.995
+  rb_fallback_min: 0.7
+  max_nmtchps: 3
+  min_distpsnr1_arcsec: 5.0
+  min_ps1_mag: 20.0
+  max_ndethist: 2
+  max_days_since_nondet: 14.0
+  min_delta_mag_from_nondet: 1.0
+  require_positive_diff: true
+  min_ssdistnr_arcsec: 10.0  # if ssdistnr is -999, it's considered "no match"
