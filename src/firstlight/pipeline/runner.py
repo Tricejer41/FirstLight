@@ -15,7 +15,7 @@ from ..storage.db import DB
 from ..pipeline.normalize import normalize
 from ..niches.n1_hostless_fast import passes_n1
 from ..tns.fink_resolver import ztf_to_tns
-from ..tns.client import TNSClient, build_minimal_at_report
+from ..tns.client import TNSClient
 from ..utils.time import now_utc, jd_to_datetime_utc
 from ..utils.fits_min import quick_stamp_metrics
 

@@ -4,7 +4,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .pipeline.runner import run_daemon
 from .tns.client import TNSClient
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,17 +35,10 @@ def main():
     if args.env:
         load_dotenv(args.env)
 
-    logging.basicConfig(level=getattr(logging, getattr(args, "log_level", "INFO")), format="%(asctime)s %(levelname)s %(message)s")
-
-    if args.cmd == "run":
-        run_daemon(
-            topics=args.topics,
-            db_path=Path(args.db),
-            config_path=Path(args.config),
-            dry_run=args.dry_run,
-            poll_timeout=args.poll_timeout,
-        )
-        return
+    logging.basicConfig(
+        level=getattr(logging, getattr(args, "log_level", "INFO")),
+        format="%(asctime)s %(levelname)s %(message)s"
+    )
 
     if args.cmd == "tns":
         c = TNSClient()
@@ -71,6 +63,18 @@ def main():
                 print("TNS_USER_AGENT:")
                 print(ua)
             return
+
+    if args.cmd == "run":
+        # Lazy import: avoids breaking TNS utilities if runner has optional deps/errors.
+        from .pipeline.runner import run_daemon
+        run_daemon(
+            topics=args.topics,
+            db_path=Path(args.db),
+            config_path=Path(args.config),
+            dry_run=args.dry_run,
+            poll_timeout=args.poll_timeout,
+        )
+        return
 
 if __name__ == "__main__":
     main()

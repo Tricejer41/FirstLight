@@ -85,3 +85,12 @@ class TNSClient:
         if isinstance(body, dict):
             return False, f"HTTP {code} id_code={body.get('id_code')} id_message={body.get('id_message')}"
         return False, f"HTTP {code}"
+
+
+def build_minimal_at_report() -> str:
+    """Return the smallest syntactically valid JSON string for a bulk-report payload.
+
+    This is used ONLY for probing auth vs. schema errors.
+    When doing real submissions, you must build a proper report structure.
+    """
+    return "{}"
