@@ -133,7 +133,8 @@ class TNSClient:
 
     def _try_post(self, url: str, data: Dict[str, str]) -> Tuple[bool, str]:
         try:
-            r = self._session.post(url, headers=self._headers(), data=data, timeout=self.timeout_s)
+            files = {k: (None, v) for k, v in data.items()}
+            r = self._session.post(url, headers=self._headers(), files=files, timeout=self.timeout_s)
         except Exception as e:
             return False, f"EXC {type(e).__name__}: {e}"
         ct = (r.headers.get("content-type") or "").lower()
@@ -187,7 +188,7 @@ class TNSClient:
                 r = self._session.post(
                     url,
                     headers=self._headers(),
-                    data={"api_key": self.cfg.api_key, "data": payload_str},
+                    files={"api_key": (None, self.cfg.api_key), "data": (None, payload_str)},
                     timeout=self.timeout_s,
                 )
             except Exception as e:
