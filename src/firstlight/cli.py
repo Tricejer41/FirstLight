@@ -45,8 +45,7 @@ def main():
         if args.tns_cmd == "probe":
             r = c.probe()
             print(f"submit_url: {r.submit_url}")
-            print(f"status_url: {r.status_url}")
-            print("notes:")
+                        print("notes:")
             for n in r.notes:
                 print(f" - {n}")
             return

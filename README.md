@@ -59,3 +59,10 @@ python -m firstlight --env .env tns probe
 ```
 
 If `submit_url` is None, keep `--dry-run` and extend endpoint candidates in `src/firstlight/tns/client.py`.
+
+### TNS endpoints (TNS 2.0)
+
+This project uses:
+- submit: `/api/set/bulk-report`
+- reply: `/api/get/bulk-report-reply`
+
