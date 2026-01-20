@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from .tns.client import TNSClient
 
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="firstlight", description="Firstlight N1 pipeline (Fink → TNS).")
     p.add_argument("--env", default=None, help="Path to .env file to load (recommended).")
@@ -23,11 +24,16 @@ def build_parser() -> argparse.ArgumentParser:
     tns = sp.add_parser("tns", help="TNS utilities.")
     tns_sp = tns.add_subparsers(dest="tns_cmd", required=True)
 
-    tns_sp.add_parser("probe", help="Probe TNS bulk-report endpoints with current env.")
+    tns_sp.add_parser("probe", help="Probe TNS submit endpoint with current env.")
     envc = tns_sp.add_parser("envcheck", help="Print env lengths (non-secret) for debugging.")
     envc.add_argument("--show-ua", action="store_true", help="Print full TNS_USER_AGENT.")
 
+    tns_sp.add_parser("submit-min", help="Submit a minimal bulk-report payload (to get a report_id or an id_message).")
+    reply = tns_sp.add_parser("reply", help="Fetch bulk-report reply for a report_id.")
+    reply.add_argument("report_id", help="report_id returned by /set/bulk-report")
+
     return p
+
 
 def main():
     args = build_parser().parse_args()
@@ -43,17 +49,9 @@ def main():
     if args.cmd == "tns":
         c = TNSClient()
 
-        if args.tns_cmd == "probe":
-            r = c.probe()
-            print(f"submit_url: {r.submit_url}")
-            print(f"reply_url: {r.reply_url}")
-            print("notes:")
-            for n in r.notes:
-                print(f" - {n}")
-            return
-
         if args.tns_cmd == "envcheck":
             import os
+
             api_key = os.getenv("TNS_API_KEY", "")
             ua = os.getenv("TNS_USER_AGENT", "")
             api_url = os.getenv("TNS_API_URL", "")
@@ -65,8 +63,32 @@ def main():
                 print(ua)
             return
 
+        if args.tns_cmd == "probe":
+            r = c.probe()
+            print(f"submit_url: {r.submit_url}")
+            print("notes:")
+            for n in r.notes:
+                print(f" - {n}")
+            return
+
+        if args.tns_cmd == "submit-min":
+            payload = c.build_submit_min_payload()
+            ok, detail, report_id = c.submit_raw(payload)
+            print(f"submit_url: {c.submit_url}")
+            print(f"result: ok={ok} detail={detail} report_id={report_id}")
+            if not ok:
+                print("NOTE: Paste the id_message here; we'll lock the exact minimal schema next.")
+            return
+
+        if args.tns_cmd == "reply":
+            ok, detail = c.fetch_reply(args.report_id)
+            print(f"reply_url: {c.reply_url}")
+            print(f"result: ok={ok} detail={detail}")
+            return
+
     if args.cmd == "run":
         from .pipeline.runner import run_daemon  # lazy import
+
         run_daemon(
             topics=args.topics,
             db_path=Path(args.db),
@@ -75,6 +97,7 @@ def main():
             poll_timeout=args.poll_timeout,
         )
         return
+
 
 if __name__ == "__main__":
     main()
