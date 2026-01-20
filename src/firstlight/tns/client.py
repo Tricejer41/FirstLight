@@ -29,8 +29,12 @@ class TNSClient:
 
     Auth requirements:
       - Strict User-Agent containing tns_marker{...} for your bot
-      - api_key provided as a multipart/form-data field
-      - data provided as a multipart/form-data field (JSON string)
+      - api_key provided as form field
+      - data provided as JSON string in form field
+
+    NOTE:
+      - /set/bulk-report works with multipart OR urlencoded on most deployments.
+      - /get/bulk-report-reply is more strict on some deployments; we send it as urlencoded form.
     """
 
     def __init__(self, api_base: str | None = None):
@@ -40,7 +44,7 @@ class TNSClient:
         self.api_key = os.getenv("TNS_API_KEY", "").strip()
         self.user_agent = os.getenv("TNS_USER_AGENT", "").strip()
 
-        # Fallback UA if user didn't set it explicitly
+        # Fallback UA if not set explicitly
         if not self.user_agent and self.bot_id and self.bot_name:
             self.user_agent = f'tns_marker{{"tns_id":{self.bot_id},"type":"bot","name":"{self.bot_name}"}}'
 
@@ -50,15 +54,6 @@ class TNSClient:
     def _headers(self) -> Dict[str, str]:
         return {"User-Agent": self.user_agent}
 
-    def _post_multipart(self, url: str, fields: Dict[str, str], timeout_s: int = 10) -> Tuple[int, Dict[str, Any] | str]:
-        # multipart/form-data even without files
-        files = {k: (None, v) for k, v in fields.items()}
-        r = requests.post(url, headers=self._headers(), files=files, timeout=timeout_s)
-        try:
-            return r.status_code, r.json()
-        except Exception:
-            return r.status_code, r.text
-
     @property
     def submit_url(self) -> str:
         return f"{self.api_base}/set/bulk-report"
@@ -67,10 +62,35 @@ class TNSClient:
     def reply_url(self) -> str:
         return f"{self.api_base}/get/bulk-report-reply"
 
+    # ---------- HTTP helpers ----------
+
+    def _post_multipart(self, url: str, fields: Dict[str, str], timeout_s: int = 10) -> Tuple[int, Dict[str, Any] | str]:
+        """
+        multipart/form-data using requests 'files' trick (no actual files).
+        """
+        files = {k: (None, v) for k, v in fields.items()}
+        r = requests.post(url, headers=self._headers(), files=files, timeout=timeout_s)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, r.text
+
+    def _post_urlencoded(self, url: str, fields: Dict[str, str], timeout_s: int = 10) -> Tuple[int, Dict[str, Any] | str]:
+        """
+        application/x-www-form-urlencoded
+        """
+        r = requests.post(url, headers=self._headers(), data=fields, timeout=timeout_s)
+        try:
+            return r.status_code, r.json()
+        except Exception:
+            return r.status_code, r.text
+
+    # ---------- Public methods ----------
+
     def probe(self) -> ProbeResult:
         """
         Probe ONLY the submit endpoint.
-        Reply endpoint cannot be probed without a valid report_id (otherwise you may get 401/400).
+        Reply endpoint cannot be probed without a valid report_id.
         """
         notes: List[str] = []
         if not self.enabled():
@@ -87,7 +107,7 @@ class TNSClient:
         ok_auth = None
         if code != 401:
             ok_auth = True
-        elif code == 401:
+        else:
             ok_auth = False
 
         notes.append(f"env lengths: api_key={len(self.api_key)} ua={len(self.user_agent)}")
@@ -106,7 +126,6 @@ class TNSClient:
 
         report_id = None
         if isinstance(body, dict):
-            # Different deployments may store report_id in different places; be tolerant.
             if "report_id" in body:
                 report_id = str(body.get("report_id"))
             data = body.get("data") if isinstance(body.get("data"), dict) else None
@@ -125,13 +144,17 @@ class TNSClient:
     def fetch_reply(self, report_id: str) -> Tuple[bool, str]:
         """
         Fetch bulk-report reply for a given report_id.
+
+        IMPORTANT: we send this as urlencoded form (NOT multipart),
+        because some TNS deployments reject multipart here and return 401.
         """
         if not self.enabled():
             return False, "TNS client disabled (missing env vars)."
 
         data_obj = {"report_id": str(report_id)}
         data_json = json.dumps(data_obj, ensure_ascii=False)
-        code, body = self._post_multipart(self.reply_url, {"api_key": self.api_key, "data": data_json}, timeout_s=25)
+
+        code, body = self._post_urlencoded(self.reply_url, {"api_key": self.api_key, "data": data_json}, timeout_s=25)
 
         if code in (200, 201, 202):
             return True, f"HTTP {code}"
@@ -143,17 +166,14 @@ class TNSClient:
     def build_submit_min_payload(self) -> dict:
         """
         Minimal-ish payload for bulk-report.
-        This is intentionally conservative: it may still 400 depending on required schema.
-        The goal is to get a clear id_message from TNS so we can lock the exact schema quickly.
+
+        This is a schema-probing payload: it worked for you in sandbox to obtain a report_id.
         """
-        # NOTE: We DON'T know your deployment's exact minimal schema yet.
-        # This structure is a common pattern: send a list of reports under "reports".
         return {
             "reports": [
                 {
                     "report_type": "AT",
                     "at_report": {
-                        # Dummy candidate; will be rejected if schema requires more fields.
                         "ra": 0.0,
                         "dec": 0.0,
                         "ra_unit": "deg",

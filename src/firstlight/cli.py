@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     envc = tns_sp.add_parser("envcheck", help="Print env lengths (non-secret) for debugging.")
     envc.add_argument("--show-ua", action="store_true", help="Print full TNS_USER_AGENT.")
 
-    tns_sp.add_parser("submit-min", help="Submit a minimal bulk-report payload (to get a report_id or an id_message).")
+    tns_sp.add_parser("submit-min", help="Submit a minimal bulk-report payload (to get report_id or id_message).")
     reply = tns_sp.add_parser("reply", help="Fetch bulk-report reply for a report_id.")
     reply.add_argument("report_id", help="report_id returned by /set/bulk-report")
 
