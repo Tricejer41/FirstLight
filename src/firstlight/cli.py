@@ -29,8 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     envc.add_argument("--show-ua", action="store_true", help="Print full TNS_USER_AGENT.")
 
     tns_sp.add_parser("submit-min", help="Submit a minimal bulk-report payload (to get report_id or id_message).")
+
     reply = tns_sp.add_parser("reply", help="Fetch bulk-report reply for a report_id.")
     reply.add_argument("report_id", help="report_id returned by /set/bulk-report")
+    reply.add_argument("--raw", action="store_true", help="Print raw JSON/text body for debugging")
 
     return p
 
@@ -81,9 +83,18 @@ def main():
             return
 
         if args.tns_cmd == "reply":
-            ok, detail = c.fetch_reply(args.report_id)
+            ok, code, body, method = c.fetch_reply_detailed(args.report_id)
             print(f"reply_url: {c.reply_url}")
-            print(f"result: ok={ok} detail={detail}")
+            print(f"result: ok={ok} http={code} via={method}")
+            if not ok:
+                if isinstance(body, dict):
+                    print(f"id_code: {body.get('id_code')}")
+                    print(f"id_message: {body.get('id_message')}")
+                else:
+                    print(body)
+            if args.raw:
+                print("---- RAW BODY ----")
+                print(body)
             return
 
     if args.cmd == "run":
