@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", default="config/n1.example.yaml", help="YAML config path for thresholds.")
     run.add_argument("--dry-run", action="store_true", help="Do everything except TNS submission.")
     run.add_argument("--poll-timeout", type=int, default=5, help="Poll timeout seconds.")
-    run.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
+    run.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
     tns = sp.add_parser("tns", help="TNS utilities.")
     tns_sp = tns.add_subparsers(dest="tns_cmd", required=True)
@@ -37,15 +37,17 @@ def main():
 
     logging.basicConfig(
         level=getattr(logging, getattr(args, "log_level", "INFO")),
-        format="%(asctime)s %(levelname)s %(message)s"
+        format="%(asctime)s %(levelname)s %(message)s",
     )
 
     if args.cmd == "tns":
         c = TNSClient()
+
         if args.tns_cmd == "probe":
             r = c.probe()
             print(f"submit_url: {r.submit_url}")
-                        print("notes:")
+            print(f"reply_url: {r.reply_url}")
+            print("notes:")
             for n in r.notes:
                 print(f" - {n}")
             return
@@ -64,8 +66,7 @@ def main():
             return
 
     if args.cmd == "run":
-        # Lazy import: avoids breaking TNS utilities if runner has optional deps/errors.
-        from .pipeline.runner import run_daemon
+        from .pipeline.runner import run_daemon  # lazy import
         run_daemon(
             topics=args.topics,
             db_path=Path(args.db),
