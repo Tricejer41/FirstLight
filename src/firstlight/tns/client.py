@@ -2,13 +2,18 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List, Union
+from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
 
-def _utc_now_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+def _utc_now_str_ms() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) + ".000"
+
+
+def _utc_str_ms_offset(seconds: int) -> str:
+    t = time.time() + float(seconds)
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t)) + ".000"
 
 
 def _stats_api_key(api_key: str) -> str:
@@ -27,11 +32,6 @@ def _safe_json(obj: Any) -> str:
 
 
 def _extract_id_fields(j: Any) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Defensive parse for typical TNS JSON:
-      {"id_code": 200, "id_message": "OK", ...}
-    Sometimes nested under "data".
-    """
     if not isinstance(j, dict):
         return None, None
     if "id_code" in j or "id_message" in j:
@@ -42,23 +42,24 @@ def _extract_id_fields(j: Any) -> Tuple[Optional[Any], Optional[str]]:
 
 
 def _find_first_key_recursive(obj: Any, keys: Tuple[str, ...]) -> Optional[Any]:
-    """
-    Recursively search dict/list for first occurrence of any key in `keys`.
-    """
     if isinstance(obj, dict):
         for k in keys:
             if k in obj and obj[k] is not None:
                 return obj[k]
-        for _, v in obj.items():
+        for v in obj.values():
             found = _find_first_key_recursive(v, keys)
             if found is not None:
                 return found
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         for item in obj:
             found = _find_first_key_recursive(item, keys)
             if found is not None:
                 return found
     return None
+
+
+def _env(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
 
 
 @dataclass
@@ -75,11 +76,6 @@ class TNSResponse:
 
 
 class TNSClient:
-    """
-    Practical TNS Bulk API client (TNS 2.0).
-    Focus: stable submit/reply plumbing + diagnostics without secrets.
-    """
-
     def __init__(self, api_base_url: str, api_key: str, user_agent: str, timeout_s: int = 30):
         self.api_base_url = api_base_url.rstrip("/")
         self.api_key = api_key
@@ -89,18 +85,27 @@ class TNSClient:
         self.submit_url = f"{self.api_base_url}/set/bulk-report"
         self.reply_url = f"{self.api_base_url}/get/bulk-report-reply"
         self.test_url = f"{self.api_base_url}/test"
-
-        # alt path for some deployments/manuals
         self.reply_url_alt = f"{self.api_base_url}/bulk-report-reply"
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": self.user_agent, "Accept": "application/json"})
 
+        # IMPORTANT: do NOT guess IDs. Empty => field omitted, reply will say "Required field" if needed.
+        self.reporting_groupid = _env("TNS_REPORTING_GROUPID", "")
+        self.discovery_data_sourceid = _env("TNS_DISCOVERY_DATA_SOURCEID", "1")  # kept as before; no error yet
+        self.instrumentid = _env("TNS_INSTRUMENTID", "1")  # kept as before; no error yet
+
+        self.photometry_flux_units = _env("TNS_PHOT_FLUX_UNITS", "1")   # previously accepted
+        self.nondet_flux_units = _env("TNS_NONDET_FLUX_UNITS", "1")     # previously accepted
+
+        self.photometry_filterid = _env("TNS_PHOT_FILTERID", "")
+        self.nondet_filter_value = _env("TNS_NONDET_FILTER_VALUE", "")
+
     @classmethod
     def from_env(cls) -> "TNSClient":
-        api_base_url = os.getenv("TNS_API_URL", "").strip()
-        api_key = os.getenv("TNS_API_KEY", "").strip()
-        user_agent = os.getenv("TNS_USER_AGENT", "").strip()
+        api_base_url = _env("TNS_API_URL")
+        api_key = _env("TNS_API_KEY")
+        user_agent = _env("TNS_USER_AGENT")
 
         missing = []
         if not api_base_url:
@@ -114,36 +119,58 @@ class TNSClient:
 
         return cls(api_base_url=api_base_url, api_key=api_key, user_agent=user_agent)
 
-    # ---------- Payload builders ----------
-
     def build_submit_min_payload(self) -> Dict[str, Any]:
-        """
-        Minimal *plausible* bulk AT report skeleton.
-        Goal: force async job creation so reply becomes queryable.
-
-        WARNING:
-        - reporting_group_id / discovery_data_source_id must match your bot perms.
-          If wrong, reply should still exist and show validation error.
-        """
-        now = _utc_now_str()
+        discovery_dt = _utc_now_str_ms()
+        nondet_dt = _utc_str_ms_offset(-86400)
         internal_name = f"ZTFTEST_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
 
-        at_entry = {
-            "ra": "10:00:00.00",
-            "dec": "+02:00:00.0",
-            "discoverydate": now,
-            "discoverymag": "19.5",
-            "discmagfilter": "r",
-            "reporter": "Firstlight Bot Test",
+        ra_deg = "150.000000"
+        dec_deg = "2.000000"
+
+        at_entry: Dict[str, Any] = {
             "internal_name": internal_name,
-            "remarks": "submit-min sanity check (sandbox) — expect validation if IDs mismatch",
-            "reporting_group_id": "1",
-            "discovery_data_source_id": "1",
+            "reporter": "Firstlight Bot Test",
+            "ra": {"value": ra_deg},
+            "dec": {"value": dec_deg},
+            "discovery_datetime": discovery_dt,
+            "at_type": "1",
+            "remarks": "submit-min (schema convergence).",
         }
 
-        return {"at_report": {"0": at_entry}}
+        if self.reporting_groupid:
+            at_entry["reporting_groupid"] = str(self.reporting_groupid)
+        if self.discovery_data_sourceid:
+            at_entry["discovery_data_sourceid"] = str(self.discovery_data_sourceid)
 
-    # ---------- HTTP helpers ----------
+        phot0: Dict[str, Any] = {
+            "obsdate": discovery_dt,
+            "flux": "19.5",
+            "fluxerr": "0.10",
+            "flux_units": str(self.photometry_flux_units),
+            "remarks": "discovery point (sandbox submit-min)",
+        }
+        if self.instrumentid:
+            phot0["instrumentid"] = str(self.instrumentid)
+        if self.photometry_filterid:
+            phot0["filterid"] = str(self.photometry_filterid)
+
+        at_entry["photometry"] = {"0": phot0}
+
+        nd: Dict[str, Any] = {
+            "obsdate": nondet_dt,
+            "archiveid": "1",
+            "limiting_flux": "22.0",
+            "flux_units": str(self.nondet_flux_units),
+            "remarks": "placeholder non-detection (schema convergence)",
+        }
+        if self.instrumentid:
+            nd["instrument_value"] = str(self.instrumentid)
+        if self.nondet_filter_value:
+            nd["filter_value"] = str(self.nondet_filter_value)
+
+        at_entry["non_detection"] = nd
+
+        return {"at_report": {"0": at_entry}}
 
     def _post_form(self, url: str, form: Dict[str, str], method_tag: str) -> TNSResponse:
         t0 = time.time()
@@ -181,11 +208,7 @@ class TNSClient:
             raw_json = None
 
         id_code, id_message = _extract_id_fields(raw_json)
-
-        # Robust report_id extraction (may be nested)
         report_id = _find_first_key_recursive(raw_json, ("report_id", "reportId", "id_report", "idReport"))
-
-        # For submit: OK when http==200 and id_code==200 (string/int)
         ok = (http == 200) and (str(id_code) == "200")
 
         return TNSResponse(
@@ -200,9 +223,15 @@ class TNSClient:
             method=method_tag,
         )
 
-    # ---------- Public API ----------
-
     def envcheck_dict(self, show_ua: bool = False) -> Dict[str, Any]:
+        warnings: List[str] = []
+        if not self.reporting_groupid:
+            warnings.append("TNS_REPORTING_GROUPID is empty (will omit reporting_groupid; set a real group ID).")
+        if not self.photometry_filterid:
+            warnings.append("TNS_PHOT_FILTERID is empty (will omit photometry.filterid; set a real filter ID).")
+        if not self.nondet_filter_value:
+            warnings.append("TNS_NONDET_FILTER_VALUE is empty (will omit non_detection.filter_value; set a real filter ID).")
+
         d = {
             "api_base_url": self.api_base_url,
             "api_key_stats": _stats_api_key(self.api_key),
@@ -210,49 +239,26 @@ class TNSClient:
             "submit_url": self.submit_url,
             "test_url": self.test_url,
             "ua_stats": _stats_ua(self.user_agent),
+            "tns_ids_stats": (
+                f"reporting_groupid={self.reporting_groupid!r} "
+                f"discovery_data_sourceid={self.discovery_data_sourceid!r} "
+                f"instrumentid={self.instrumentid!r} "
+                f"phot_flux_units={self.photometry_flux_units!r} nondet_flux_units={self.nondet_flux_units!r} "
+                f"phot_filterid={self.photometry_filterid!r} nondet_filter_value={self.nondet_filter_value!r}"
+            ),
+            "warnings": warnings,
         }
         if show_ua:
             d["user_agent"] = self.user_agent
         return d
 
     def submit_raw(self, payload: Dict[str, Any]) -> Tuple[bool, str, Optional[Any], Optional[Dict[str, Any]]]:
-        """
-        Submit bulk report. Known-good path in your environment:
-          form(api_key, data=jsonstr)
-        Returns:
-          ok, detail, report_id, raw_json
-        """
         data_jsonstr = json.dumps(payload)
 
         attempts: List[TNSResponse] = []
-
-        # 1) form-urlencoded (your stable success path)
-        attempts.append(
-            self._post_form(
-                self.submit_url,
-                {"api_key": self.api_key, "data": data_jsonstr},
-                "submit:form(api_key,data=jsonstr)",
-            )
-        )
-
-        # 2) multipart data as part (keep only for diagnostics)
-        attempts.append(
-            self._post_multipart(
-                self.submit_url,
-                {"api_key": self.api_key},
-                {"data": (None, data_jsonstr)},
-                "submit:multipart(api_key in data, data as part)",
-            )
-        )
-
-        # 3) JSON (often 401 in sandbox; keep only for diagnostics)
-        attempts.append(
-            self._post_json(
-                self.submit_url,
-                {"api_key": self.api_key, "data": payload},
-                "submit:json(api_key,data_obj)",
-            )
-        )
+        attempts.append(self._post_form(self.submit_url, {"api_key": self.api_key, "data": data_jsonstr}, "submit:form(api_key,data=jsonstr)"))
+        attempts.append(self._post_multipart(self.submit_url, {"api_key": self.api_key}, {"data": (None, data_jsonstr)}, "submit:multipart(api_key in data, data as part)"))
+        attempts.append(self._post_json(self.submit_url, {"api_key": self.api_key, "data": payload}, "submit:json(api_key,data_obj)"))
 
         best = next((a for a in attempts if a.http == 200 and str(a.id_code) == "200"), attempts[0])
 
@@ -266,13 +272,9 @@ class TNSClient:
         return best.ok, detail, best.report_id, best.raw_json
 
     def submit_min(self) -> Tuple[bool, str, Optional[Any], Optional[Dict[str, Any]]]:
-        payload = self.build_submit_min_payload()
-        return self.submit_raw(payload)
+        return self.submit_raw(self.build_submit_min_payload())
 
     def reply(self, report_id: Any, wait_s: int = 600) -> Tuple[bool, str, Dict[str, Any]]:
-        """
-        Poll for reply. Treat 404 as pending.
-        """
         rid = str(report_id).strip()
         if not rid:
             return False, "report_id is empty; cannot query reply", {"id_code": "client_error", "id_message": "empty report_id"}
@@ -287,48 +289,28 @@ class TNSClient:
             out.append(self._get_params(url, {"api_key": self.api_key, "report_id": rid}, "reply:GET(params)"))
             return out
 
-        start = time.time()
-        tries = 0
-        sleep_s = 2.0
+        tries = 1
+        attempts = one_round(self.reply_url)
+        if all(a.http == 401 for a in attempts):
+            attempts += one_round(self.reply_url_alt)
 
-        last_json: Dict[str, Any] = {"id_code": None, "id_message": None}
+        best = next((a for a in attempts if a.http == 200 and a.raw_json is not None), None)
+        if best is None:
+            non401 = [a for a in attempts if a.http != 401]
+            best = non401[0] if non401 else attempts[0]
 
-        while True:
-            tries += 1
-            attempts = one_round(self.reply_url)
-
-            # If everything is 401, try alt endpoint once
-            if all(a.http == 401 for a in attempts):
-                attempts += one_round(self.reply_url_alt)
-
-            best = next((a for a in attempts if a.http == 200 and a.raw_json is not None), None)
-            if best is None:
-                # prefer non-401 informative
-                non401 = [a for a in attempts if a.http != 401]
-                best = non401[0] if non401 else attempts[0]
-
-            last_json = best.raw_json or {"id_code": best.id_code, "id_message": best.id_message}
-
-            # terminal success
-            if best.http == 200 and isinstance(best.raw_json, dict):
-                ok = str(best.raw_json.get("id_code")) == "200"
-                detail = (
-                    f"via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
-                    f"id_code={best.id_code} id_message={best.id_message} tries={tries} "
-                    f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
-                )
-                return ok, detail, best.raw_json
-
-            # pending
-            if best.http == 404 and (time.time() - start) < wait_s:
-                time.sleep(sleep_s)
-                sleep_s = min(20.0, sleep_s * 1.35)
-                continue
-
-            status = "pending_timeout" if best.http == 404 else "terminal"
+        if best.http == 200 and isinstance(best.raw_json, dict):
+            ok = str(best.raw_json.get("id_code")) == "200"
             detail = (
-                f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
-                f"id_code={best.id_code} id_message={best.id_message} tries={tries} status={status} "
+                f"via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
+                f"id_code={best.id_code} id_message={best.id_message} tries={tries} "
                 f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
             )
-            return False, detail, last_json
+            return ok, detail, best.raw_json
+
+        detail = (
+            f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
+            f"id_code={best.id_code} id_message={best.id_message} tries={tries} status=terminal "
+            f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+        )
+        return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})

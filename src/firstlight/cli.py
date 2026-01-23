@@ -1,5 +1,4 @@
 import argparse
-import os
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -55,7 +54,9 @@ def main() -> None:
             print("submit_raw_json:")
             print(_safe_json(raw_json))
         if report_id is None:
-            print("NOTE: report_id is missing in server JSON OR not extracted. Use --raw to inspect submit JSON.")
+            print("NOTE: report_id missing — inspect submit_raw_json and extraction logic.")
+        else:
+            print("NOTE: Run `tns reply <REPORT_ID> --raw` to see validation feedback and converge schema.")
         return
 
     if args.tns_cmd == "reply":
