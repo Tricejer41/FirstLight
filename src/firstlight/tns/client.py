@@ -62,6 +62,32 @@ def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    s = _env(name, "")
+    try:
+        return int(s)
+    except Exception:
+        return int(default)
+
+
+def _extract_reply_objname(reply_json: Dict[str, Any]) -> Optional[str]:
+    """
+    Best-effort extraction of 'objname' from the reply feedback structure.
+    Safe to keep even if structure changes: returns None on any mismatch.
+    """
+    try:
+        fb = reply_json.get("data", {}).get("feedback", {})
+        at = fb.get("at_report", [])
+        if isinstance(at, list) and at:
+            first = at[0]
+            if isinstance(first, dict):
+                objname = _find_first_key_recursive(first, ("objname",))
+                return str(objname) if objname is not None else None
+    except Exception:
+        pass
+    return None
+
+
 @dataclass
 class TNSResponse:
     ok: bool
@@ -117,7 +143,8 @@ class TNSClient:
         if missing:
             raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-        return cls(api_base_url=api_base_url, api_key=api_key, user_agent=user_agent)
+        timeout_s = _env_int("TNS_TIMEOUT_S", 30)
+        return cls(api_base_url=api_base_url, api_key=api_key, user_agent=user_agent, timeout_s=timeout_s)
 
     def build_submit_min_payload(self) -> Dict[str, Any]:
         discovery_dt = _utc_now_str_ms()
@@ -169,7 +196,6 @@ class TNSClient:
             nd["filter_value"] = str(self.nondet_filter_value)
 
         at_entry["non_detection"] = nd
-
         return {"at_report": {"0": at_entry}}
 
     def _post_form(self, url: str, form: Dict[str, str], method_tag: str) -> TNSResponse:
@@ -239,6 +265,7 @@ class TNSClient:
             "submit_url": self.submit_url,
             "test_url": self.test_url,
             "ua_stats": _stats_ua(self.user_agent),
+            "timeout_s": self.timeout_s,
             "tns_ids_stats": (
                 f"reporting_groupid={self.reporting_groupid!r} "
                 f"discovery_data_sourceid={self.discovery_data_sourceid!r} "
@@ -274,7 +301,7 @@ class TNSClient:
     def submit_min(self) -> Tuple[bool, str, Optional[Any], Optional[Dict[str, Any]]]:
         return self.submit_raw(self.build_submit_min_payload())
 
-    def reply(self, report_id: Any, wait_s: int = 600) -> Tuple[bool, str, Dict[str, Any]]:
+    def reply(self, report_id: Any, wait_s: int = 600, poll_s: int = 10) -> Tuple[bool, str, Dict[str, Any]]:
         rid = str(report_id).strip()
         if not rid:
             return False, "report_id is empty; cannot query reply", {"id_code": "client_error", "id_message": "empty report_id"}
@@ -289,28 +316,51 @@ class TNSClient:
             out.append(self._get_params(url, {"api_key": self.api_key, "report_id": rid}, "reply:GET(params)"))
             return out
 
-        tries = 1
-        attempts = one_round(self.reply_url)
-        if all(a.http == 401 for a in attempts):
-            attempts += one_round(self.reply_url_alt)
+        deadline = time.time() + max(0, int(wait_s))
+        tries = 0
 
-        best = next((a for a in attempts if a.http == 200 and a.raw_json is not None), None)
-        if best is None:
-            non401 = [a for a in attempts if a.http != 401]
-            best = non401[0] if non401 else attempts[0]
+        while True:
+            tries += 1
+            attempts = one_round(self.reply_url)
+            if all(a.http == 401 for a in attempts):
+                attempts += one_round(self.reply_url_alt)
 
-        if best.http == 200 and isinstance(best.raw_json, dict):
-            ok = str(best.raw_json.get("id_code")) == "200"
+            best = next((a for a in attempts if a.http == 200 and isinstance(a.raw_json, dict)), None)
+            if best is None:
+                non401 = [a for a in attempts if a.http != 401]
+                best = non401[0] if non401 else attempts[0]
+
+            if best.http == 200 and isinstance(best.raw_json, dict):
+                ok = str(best.raw_json.get("id_code")) == "200"
+                detail = (
+                    f"via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
+                    f"id_code={best.id_code} id_message={best.id_message} tries={tries} "
+                    f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+                )
+                return ok, detail, best.raw_json
+
+            # Common on TNS: reply endpoint returns 404 until processing is done.
+            if best.http == 404 and time.time() < deadline:
+                time.sleep(max(1, int(poll_s)))
+                continue
+
             detail = (
-                f"via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
-                f"id_code={best.id_code} id_message={best.id_message} tries={tries} "
+                f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
+                f"id_code={best.id_code} id_message={best.id_message} tries={tries} status=terminal "
                 f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
             )
-            return ok, detail, best.raw_json
+            return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
 
-        detail = (
-            f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
-            f"id_code={best.id_code} id_message={best.id_message} tries={tries} status=terminal "
-            f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
-        )
-        return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
+    def submit_and_reply(self, payload: Dict[str, Any], wait_s: int = 600, poll_s: int = 10) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+        ok_s, detail_s, report_id, submit_json = self.submit_raw(payload)
+        if not ok_s or report_id is None:
+            return (
+                False,
+                f"submit_failed: {detail_s}",
+                None,
+                (submit_json or {"id_code": "submit_failed", "id_message": "submit failed"}),
+            )
+
+        ok_r, detail_r, reply_json = self.reply(report_id=report_id, wait_s=wait_s, poll_s=poll_s)
+        objname = _extract_reply_objname(reply_json) if isinstance(reply_json, dict) else None
+        return ok_r, f"{detail_s} | reply: {detail_r}", objname, reply_json
