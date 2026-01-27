@@ -11,7 +11,7 @@ Start-Process -NoNewWindow -FilePath "python" -ArgumentList @(
   "scripts/replay_avro_dir.py",
   "alertDB/raw/$run",
   "--cfg","config/n1.example.yaml",
-  "--db","firstlight.sqlite",
+  "--db","firstlight_prod.sqlite",
   "--follow",
   "--poll-s","2",
   "--jsonl","alertDB/logs/$run/replay.jsonl",
