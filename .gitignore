@@ -13,3 +13,6 @@ firstlight.sqlite
 alertDB/
 secrets/
 .env
+_salvage_client.py
+scripts/db_check.py
+scripts/db_max.py
