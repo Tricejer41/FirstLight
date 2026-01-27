@@ -15,7 +15,7 @@ Start-Process -NoNewWindow -FilePath "python" -ArgumentList @(
   "--follow",
   "--poll-s","2",
   "--jsonl","alertDB/logs/$run/replay.jsonl",
-  "--print-every","200",
+  "--print-every","25",
   "--topic","hostless_ztf"
 )
 

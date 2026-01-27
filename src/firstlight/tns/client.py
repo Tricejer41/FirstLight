@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 
+from ..utils.time import jd_to_datetime_utc
+
 
 def _utc_now_str_ms() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) + ".000"
@@ -14,6 +16,12 @@ def _utc_now_str_ms() -> str:
 def _utc_str_ms_offset(seconds: int) -> str:
     t = time.time() + float(seconds)
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t)) + ".000"
+
+
+def _fmt_tns_dt(dt) -> str:
+    # TNS Bulk API accepts "YYYY-MM-DD HH:MM:SS.sss" (UTC). Keep ms fixed.
+    import datetime as _dt
+    return dt.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S") + ".000"
 
 
 def _stats_api_key(api_key: str) -> str:
@@ -70,6 +78,33 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _choose_filter_ids(fid: int, phot_filterid_env: str, nondet_filter_value_env: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fix for your bug:
+      If env var is 'auto', we MUST NOT send 'auto' to TNS.
+      We instead map fid -> proper numeric filter ids.
+
+    ZTF fid: 1=g, 2=r, 3=i
+    Common TNS AUX mapping used in your salvage branch: 110/111/112
+    """
+    ztf_map = {1: "110", 2: "111", 3: "112"}
+
+    phot = (phot_filterid_env or "").strip()
+    nd = (nondet_filter_value_env or "").strip()
+
+    if phot and phot.lower() != "auto":
+        phot_id = phot
+    else:
+        phot_id = ztf_map.get(int(fid), None)
+
+    if nd and nd.lower() != "auto":
+        nd_id = nd
+    else:
+        nd_id = ztf_map.get(int(fid), None)
+
+    return phot_id, nd_id
+
+
 def _extract_reply_objname(reply_json: Dict[str, Any]) -> Optional[str]:
     """
     Best-effort extraction of 'objname' from the reply feedback structure.
@@ -124,6 +159,7 @@ class TNSClient:
         self.photometry_flux_units = _env("TNS_PHOT_FLUX_UNITS", "1")   # previously accepted
         self.nondet_flux_units = _env("TNS_NONDET_FLUX_UNITS", "1")     # previously accepted
 
+        # Can be "auto" or a numeric id like "111"
         self.photometry_filterid = _env("TNS_PHOT_FILTERID", "")
         self.nondet_filter_value = _env("TNS_NONDET_FILTER_VALUE", "")
 
@@ -178,8 +214,11 @@ class TNSClient:
         }
         if self.instrumentid:
             phot0["instrumentid"] = str(self.instrumentid)
-        if self.photometry_filterid:
-            phot0["filterid"] = str(self.photometry_filterid)
+
+        # IMPORTANT: if env is "auto", do NOT send "auto" => map fid=2 -> 111
+        phot_filterid, _ = _choose_filter_ids(2, self.photometry_filterid or "auto", self.nondet_filter_value or "auto")
+        if phot_filterid:
+            phot0["filterid"] = str(phot_filterid)
 
         at_entry["photometry"] = {"0": phot0}
 
@@ -192,10 +231,118 @@ class TNSClient:
         }
         if self.instrumentid:
             nd["instrument_value"] = str(self.instrumentid)
-        if self.nondet_filter_value:
-            nd["filter_value"] = str(self.nondet_filter_value)
+
+        _, nd_filter = _choose_filter_ids(2, self.photometry_filterid or "auto", self.nondet_filter_value or "auto")
+        if nd_filter:
+            nd["filter_value"] = str(nd_filter)
 
         at_entry["non_detection"] = nd
+        return {"at_report": {"0": at_entry}}
+
+    def build_at_report_from_fink_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Builds an AT report payload from a Fink alert payload.
+        This is required by `tns dispatch-sandbox`.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be dict")
+        if "objectId" not in payload or "candidate" not in payload:
+            raise ValueError("payload missing objectId/candidate")
+
+        objid = str(payload["objectId"])
+        c = payload["candidate"] or {}
+        d = payload.get("derived", {}) or {}
+
+        ra = float(c["ra"])
+        dec = float(c["dec"])
+        jd = float(c["jd"])
+        fid = int(c.get("fid", 0))
+
+        mag = float(c["magpsf"])
+        magerr = float(c.get("sigmapsf", 0.0))
+        limmag = float(c.get("diffmaglim", mag + 1.0))
+
+        cand_id = str(c.get("candid", "")).strip()
+        internal_name = f"{objid}_{cand_id}" if cand_id else objid
+
+        discovery_dt = _fmt_tns_dt(jd_to_datetime_utc(jd))
+
+        # Non-detection best-effort, else jd-1 day
+        nd_jd = None
+        nd_lim = None
+
+        for k in ("last_nondet_jd", "last_nondetjd", "last_nd_jd", "last_jd_nd", "jd_last_nondet"):
+            if k in d:
+                try:
+                    nd_jd = float(d[k])
+                    break
+                except Exception:
+                    pass
+
+        for k in ("last_nondet_lim", "last_nondet_diffmaglim", "last_nd_lim", "limmag_last_nondet"):
+            if k in d:
+                try:
+                    nd_lim = float(d[k])
+                    break
+                except Exception:
+                    pass
+
+        if nd_jd is None:
+            nd_jd = jd - 1.0
+        if nd_lim is None:
+            nd_lim = limmag
+        if nd_jd >= jd:
+            nd_jd = jd - 1.0
+
+        nondet_dt = _fmt_tns_dt(jd_to_datetime_utc(nd_jd))
+
+        phot_filterid, nondet_filter_value = _choose_filter_ids(
+            fid, self.photometry_filterid or "auto", self.nondet_filter_value or "auto"
+        )
+
+        at_entry: Dict[str, Any] = {
+            "internal_name": internal_name,
+            "reporter": "Firstlight",
+            "ra": {"value": f"{ra:.6f}"},
+            "dec": {"value": f"{dec:.6f}"},
+            "discovery_datetime": discovery_dt,
+            "at_type": "1",
+            "remarks": f"firstlight auto (objId={objid} candid={cand_id} fid={fid})",
+        }
+
+        if self.reporting_groupid:
+            at_entry["reporting_groupid"] = str(self.reporting_groupid)
+        if self.discovery_data_sourceid:
+            at_entry["discovery_data_sourceid"] = str(self.discovery_data_sourceid)
+
+        phot0: Dict[str, Any] = {
+            "obsdate": discovery_dt,
+            "flux": f"{mag:.3f}",
+            "fluxerr": f"{magerr:.3f}",
+            "flux_units": str(self.photometry_flux_units),
+            "remarks": "discovery photometry (ZTF magpsf)",
+        }
+        if self.instrumentid:
+            phot0["instrumentid"] = str(self.instrumentid)
+        if phot_filterid:
+            phot0["filterid"] = str(phot_filterid)
+
+        at_entry["photometry"] = {"0": phot0}
+
+        nd: Dict[str, Any] = {
+            "obsdate": nondet_dt,
+            "archiveid": "1",
+            "limiting_flux": f"{nd_lim:.3f}",
+            "flux_units": str(self.nondet_flux_units),
+            "remarks": "last non-detection (fallback if broker lacks prv_candidates)",
+        }
+        if self.instrumentid:
+            nd["instrument_value"] = str(self.instrumentid)
+        if nondet_filter_value:
+            nd["filter_value"] = str(nondet_filter_value)
+
+        at_entry["non_detection"] = nd
+
         return {"at_report": {"0": at_entry}}
 
     def _post_form(self, url: str, form: Dict[str, str], method_tag: str) -> TNSResponse:
