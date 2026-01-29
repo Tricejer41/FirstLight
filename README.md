@@ -66,3 +66,53 @@ This project uses:
 - submit: `/api/set/bulk-report`
 - reply: `/api/get/bulk-report-reply`
 
+
+
+# Night runner (ingesta nocturna)
+
+## Qué ejecuta
+La tarea programada **FirstLight Night Runner** lanza `scripts/run_night_wrapper.ps1` (PowerShell).
+
+El wrapper:
+- fuerza logs en `C:\ProgramData\FirstLight\logs\scheduler\`
+- lanza `scripts/run_night.ps1` con:
+  - `PythonExe` y `FinkConsumerExe` absolutos (del venv)
+  - `MaxHours` (duración máxima del run)
+
+`run_night.ps1` lanza 3 procesos en paralelo:
+1) **fink_consumer**  
+   Guarda ficheros `.avro` en:
+   - `alertDB/raw/<RUN>/`
+
+2) **replay watcher** (`scripts/replay_avro_dir.py --follow`)  
+   Vigila el directorio raw y por cada `.avro`:
+   - normaliza el alert
+   - aplica el filtro N1
+   - inserta en SQLite:
+     - `alerts` (raw_json)
+     - `decisions` (passed/reason/metrics_json)
+   Además escribe auditoría en:
+   - `alertDB/logs/<RUN>/replay.jsonl`
+
+3) **dispatch loop** (`scripts/dispatch_loop.ps1`)  
+   Cada `EveryS` segundos:
+   - consulta decisiones recientes en SQLite
+   - intenta enviar al sandbox TNS (o dry-run)
+   - registra en:
+     - `alertDB/logs/<RUN>/dispatch.out.log`
+
+## Estructura de directorios
+- `alertDB/raw/<RUN>/` : AVRO descargados por `fink_consumer`
+- `alertDB/logs/<RUN>/` : logs por proceso (consumer/replay/dispatch)
+- `C:\ProgramData\FirstLight\logs\scheduler\` : logs del scheduler (wrapper)
+
+## Cómo monitorizar
+- Ver último run del scheduler:
+  - `dir C:\ProgramData\FirstLight\logs\scheduler | sort LastWriteTime -Descending | select -First 5`
+- Ver el run actual (RUN=...):
+  - `Get-Content <night_*.out.log> -Tail 50`
+- Ver si SQLite se llena:
+  - `python -c "import sqlite3; c=sqlite3.connect('firstlight.sqlite'); print(c.execute('select count(*) from alerts').fetchone()[0])"`
+
+## Cómo parar
+- `schtasks /End /TN "FirstLight Night Runner"`

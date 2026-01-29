@@ -5,18 +5,23 @@ param(
   [int]$MaxSubmit = 3,
   [int]$WaitS = 120,
   [int]$EveryS = 60,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$PythonExe = ""
 )
+
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+  $PythonExe = (Get-Command python -ErrorAction Stop).Source
+}
 
 $dryArg = @()
 if ($DryRun) { $dryArg = @("--dry-run") }
 
-Write-Host "dispatch_loop: db=$DB since_hours=$SinceHours max_submit=$MaxSubmit every_s=$EveryS dry_run=$($DryRun.IsPresent)"
+Write-Host "dispatch_loop: python=$PythonExe db=$DB since_hours=$SinceHours max_submit=$MaxSubmit every_s=$EveryS dry_run=$($DryRun.IsPresent)"
 
 while ($true) {
   $ts = (Get-Date).ToString("s")
   Write-Host "[$ts] dispatch tick..."
-  & python -m firstlight --env $EnvFile tns dispatch-sandbox `
+  & $PythonExe -m firstlight --env $EnvFile tns dispatch-sandbox `
       --db $DB `
       --since-hours $SinceHours `
       --max-submit $MaxSubmit `
