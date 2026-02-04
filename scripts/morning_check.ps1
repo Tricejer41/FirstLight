@@ -1,6 +1,6 @@
 # scripts/morning_check.ps1
 # Quick morning health + stats for FirstLight sandbox runs
-# Usage (examples):
+# Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1
 #   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1 -Db .\firstlight.sqlite -LogsRoot .\alertDB\logs -RawRoot .\alertDB\raw
 
@@ -8,7 +8,16 @@ param(
   [string]$Db = ".\firstlight.sqlite",
   [string]$LogsRoot = ".\alertDB\logs",
   [string]$RawRoot  = ".\alertDB\raw",
-  [int]$Tail = 25
+  [int]$Tail = 25,
+
+  # How many recent tns_actions to print
+  [int]$TnsTail = 20,
+
+  # Duplicate threshold alert
+  [int]$DupTopN = 10,
+
+  # Hours window for "recent" stats (default 24h, but configurable)
+  [int]$WindowHours = 24
 )
 
 Set-StrictMode -Version Latest
@@ -31,6 +40,31 @@ function Print-Section([string]$title) {
   Write-Host ("=" * 78)
   Write-Host $title
   Write-Host ("=" * 78)
+}
+
+# ---------------------------------------------------------------------------
+# Option B: Run python via a temp .py file (no python -c), so quoting is stable
+# ---------------------------------------------------------------------------
+function Invoke-PythonTempScript {
+  param(
+    [Parameter(Mandatory=$true)][string] $Code,
+    [Parameter(Mandatory=$false)][string[]] $Args = @()
+  )
+
+  $tmp = Join-Path $env:TEMP ("firstlight_inline_{0}.py" -f ([guid]::NewGuid().ToString("N")))
+  try {
+    # UTF-8 no BOM: avoids weird characters issues
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($tmp, $Code, $utf8NoBom)
+
+    & python $tmp @Args
+    if ($LASTEXITCODE -ne 0) {
+      throw "Python exited with code $LASTEXITCODE"
+    }
+  }
+  finally {
+    Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+  }
 }
 
 # --- Resolve paths ---
@@ -129,36 +163,164 @@ if (Test-Path $dispatchOut) {
 $replayJsonl = Join-Path $lastLogDir.FullName "replay.jsonl"
 Print-Section "Replay reasons (top)"
 if (Test-Path $replayJsonl) {
-  python -c "import json,collections,pathlib; p=r'$replayJsonl'; c=collections.Counter(); 
+  $py = @"
+import json, collections, pathlib, sys
+p = sys.argv[1]
+c = collections.Counter()
 for ln in pathlib.Path(p).read_text(encoding='utf-8').splitlines():
-  o=json.loads(ln)
-  r=o.get('reason')
-  if r: c[r]+=1
-print('reasons_top=', c.most_common(10))"
+    o = json.loads(ln)
+    r = o.get('reason')
+    if r:
+        c[r] += 1
+print('reasons_top=', c.most_common(10))
+"@
+  Invoke-PythonTempScript -Code $py -Args @($replayJsonl)
 } else {
   Write-Host "No replay.jsonl in latest run."
 }
 
-# --- DB counts + last 24h deltas ---
+# --- DB counts + window deltas ---
 Print-Section "DB counts"
 if (-not (Test-Path $dbAbs)) {
   Write-Host "DB not found."
   exit 1
 }
 
-python -c "import sqlite3,datetime; 
-db=r'$dbAbs'; con=sqlite3.connect(db); 
-def cnt(q,params=()): 
-  try: return con.execute(q,params).fetchone()[0]
-  except Exception: return None
-print('DB=',db)
+$py = @"
+import sqlite3, sys
+from datetime import datetime, timedelta, timezone
+
+db = sys.argv[1]
+hours = int(sys.argv[2])
+
+con = sqlite3.connect(db)
+
+def cnt(q, params=()):
+    try:
+        return con.execute(q, params).fetchone()[0]
+    except Exception:
+        return None
+
+print('DB=', db)
 print('alerts=', cnt('select count(*) from alerts'))
 print('decisions=', cnt('select count(*) from decisions'))
 print('tns_actions=', cnt('select count(*) from tns_actions'))
-# 24h window based on created_utc string ISO; best-effort
-cut=(datetime.datetime.utcnow()-datetime.timedelta(hours=24)).replace(microsecond=0).isoformat()
-print('cut_utc_24h=',cut)
-print('alerts_24h=', cnt('select count(*) from alerts where created_utc>=?', (cut,)))
-print('decisions_24h=', cnt('select count(*) from decisions where created_utc>=?', (cut,)))
-print('passed_24h=', cnt('select count(*) from decisions where created_utc>=? and passed=1', (cut,)))
-print('tns_actions_24h=', cnt('select count(*) from tns_actions where created_utc>=?', (cut,)))"
+
+cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
+print('cut_utc_window=', cut, '(hours=', hours, ')')
+
+print('alerts_window=', cnt('select count(*) from alerts where created_utc>=?', (cut,)))
+print('decisions_window=', cnt('select count(*) from decisions where created_utc>=?', (cut,)))
+print('passed_window=', cnt('select count(*) from decisions where created_utc>=? and passed=1', (cut,)))
+print('tns_actions_window=', cnt('select count(*) from tns_actions where created_utc>=?', (cut,)))
+"@
+Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours")
+
+# --- TNS actions health ---
+Print-Section "TNS actions (health)"
+
+$py = @"
+import sqlite3, sys
+from datetime import datetime, timedelta, timezone
+from collections import Counter
+
+db = sys.argv[1]
+hours = int(sys.argv[2])
+dup_top_n = int(sys.argv[3])
+tail = int(sys.argv[4])
+
+con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
+
+cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
+
+def qall(sql, params=()):
+    return con.execute(sql, params).fetchall()
+
+def qone(sql, params=()):
+    r = con.execute(sql, params).fetchone()
+    return r[0] if r else None
+
+def classify_detail(s):
+    s = (s or '')
+    s_low = s.lower()
+
+    if ('fatal=auth' in s_low) or ('unauthorized' in s_low) or ('http=401' in s_low) or (' 401' in s_low):
+        return 'auth_401'
+    if ('http=403' in s_low) or (' 403' in s_low) or ('forbidden' in s_low):
+        return 'auth_403'
+    if ('timeout' in s_low) or ('timed out' in s_low):
+        return 'timeout'
+    if 'submit_failed' in s_low:
+        return 'submit_failed'
+    if ('ok' in s_low) and ('objname=' in s_low):
+        return 'ok_submitted'
+    if ('http=200' in s_low) and ('id_code=200' in s_low):
+        return 'ok_http200'
+    return 'other'
+
+# 1) counts by action (window + all-time)
+rows_all = qall('select action, count(*) as n from tns_actions group by action order by n desc')
+rows_win = qall('select action, count(*) as n from tns_actions where created_utc>=? group by action order by n desc', (cut,))
+print('by_action_all=', [(r['action'], r['n']) for r in rows_all])
+print('by_action_window=', [(r['action'], r['n']) for r in rows_win])
+
+# 2) detail classification (window)
+rows = qall('select detail from tns_actions where created_utc>=?', (cut,))
+c = Counter()
+for r in rows:
+    c[classify_detail(r['detail'])] += 1
+print('detail_class_window=', c.most_common())
+
+# 3) duplicates by (object_id,candid,action) in window
+dup = qall('''
+select object_id, candid, action, count(*) as n
+from tns_actions
+where created_utc>=?
+group by object_id, candid, action
+having count(*)>1
+order by n desc
+limit ?
+''', (cut, dup_top_n))
+print('dups_window_top=', [(r['object_id'], r['candid'], r['action'], r['n']) for r in dup])
+
+# 4) ratio actions per passed (window) + actions split
+passed = qone('select count(*) from decisions where created_utc>=? and passed=1', (cut,)) or 0
+acts   = qone('select count(*) from tns_actions where created_utc>=?', (cut,)) or 0
+ratio = (acts / passed) if passed else None
+print('passed_window=', passed, 'tns_actions_window=', acts, 'actions_per_passed=', ratio)
+
+np = qall('''
+select
+  sum(case when d.passed=1 then 1 else 0 end) as actions_on_passed,
+  sum(case when d.passed=0 then 1 else 0 end) as actions_on_not_passed,
+  sum(case when d.passed is null then 1 else 0 end) as actions_no_decision
+from tns_actions a
+left join decisions d
+  on a.object_id=d.object_id and a.candid=d.candid
+where a.created_utc>=?
+''', (cut,))
+if np:
+    r = np[0]
+    print('actions_split_window=', {
+        'on_passed': r['actions_on_passed'],
+        'on_not_passed': r['actions_on_not_passed'],
+        'no_decision_match': r['actions_no_decision']
+    })
+
+# 5) last N actions (most recent)
+last = qall(
+    'select created_utc, action, object_id, candid, report_id, substr(detail,1,180) as detail_snip '
+    'from tns_actions order by created_utc desc limit ?',
+    (tail,)
+)
+print('last_actions=')
+for r in last:
+    line = "- {0} action={1} obj={2} candid={3} report_id={4} detail={5}".format(
+        r['created_utc'], r['action'], r['object_id'], r['candid'], r['report_id'], r['detail_snip']
+    )
+    print(line)
+"@
+Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours", "$DupTopN", "$TnsTail")
+
+# End

@@ -9,6 +9,10 @@ Goals:
 - Idempotent schema init.
 - Backwards compatible with existing scripts (DB.add_alert/add_decision/close).
 - Dispatch helpers work even if DB was created with old schema.
+
+IMPORTANT stability rule:
+- Only successful submissions should block re-dispatch.
+- "skipped" used for transient failures must NOT permanently block candidates.
 """
 
 from __future__ import annotations
@@ -96,7 +100,6 @@ class DB:
     def _has_column(self, table: str, col: str) -> bool:
         info = self._table_info(table)
         for r in info:
-            # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
             if len(r) >= 2 and r[1] == col:
                 return True
         return False
@@ -114,7 +117,6 @@ class DB:
     def _init_schema(self) -> None:
         cur = self._con.cursor()
 
-        # Create tables if missing (new schema)
         if not self._has_table("alerts"):
             cur.execute(
                 """
@@ -152,7 +154,7 @@ class DB:
                   id             INTEGER PRIMARY KEY AUTOINCREMENT,
                   object_id      TEXT NOT NULL,
                   candid         TEXT NOT NULL,
-                  action         TEXT NOT NULL,         -- "submitted" | "skipped" | ...
+                  action         TEXT NOT NULL,         -- "submitted" | "failed" | ...
                   report_id      TEXT,
                   detail         TEXT NOT NULL,
                   reply_json     TEXT,
@@ -163,14 +165,11 @@ class DB:
 
         self._con.commit()
 
-        # Detect legacy columns and migrate minimally (non-destructive)
-
         # alerts: prefer raw_json, fallback to payload_json
         alerts_has_raw = self._has_column("alerts", "raw_json")
         alerts_has_payload = self._has_column("alerts", "payload_json")
 
         if (not alerts_has_raw) and alerts_has_payload:
-            # add raw_json nullable and backfill from payload_json
             self._try_exec("ALTER TABLE alerts ADD COLUMN raw_json TEXT;")
             self._try_exec("UPDATE alerts SET raw_json = payload_json WHERE raw_json IS NULL;")
             alerts_has_raw = self._has_column("alerts", "raw_json")
@@ -181,18 +180,14 @@ class DB:
         decisions_has_created = self._has_column("decisions", "created_utc")
         decisions_has_decided = self._has_column("decisions", "decided_utc")
 
-        # If created_utc exists but is all 1970, and decided_utc exists, backfill created_utc from decided_utc
         if decisions_has_created and decisions_has_decided:
             row = self._con.execute("SELECT MIN(created_utc) AS mn, MAX(created_utc) AS mx FROM decisions").fetchone()
             mn = (row["mn"] if row else None)
             mx = (row["mx"] if row else None)
             if _is_legacy_epoch(mn) and _is_legacy_epoch(mx):
-                # Backfill (best effort)
                 self._try_exec("UPDATE decisions SET created_utc = decided_utc WHERE created_utc LIKE '1970-01-01T00:00:00%';")
 
-        # choose time column for dispatch
         if decisions_has_decided:
-            # Prefer decided_utc if created_utc still looks legacy
             row2 = self._con.execute("SELECT MIN(created_utc) AS mn, MAX(created_utc) AS mx FROM decisions").fetchone()
             mn2 = (row2["mn"] if row2 else None)
             mx2 = (row2["mx"] if row2 else None)
@@ -203,12 +198,10 @@ class DB:
         else:
             self._decisions_time_col = "created_utc" if decisions_has_created else "created_utc"
 
-        # tns_actions schema detection
         self._tns_has_outcome = self._has_column("tns_actions", "outcome")
         self._tns_has_reply_json = self._has_column("tns_actions", "reply_json") or self._has_column("tns_actions", "detail_json")
         self._tns_has_report_id = self._has_column("tns_actions", "report_id")
 
-        # Add missing helpful indexes (best-effort; ignore failures)
         self._try_exec("CREATE INDEX IF NOT EXISTS idx_decisions_passed_created ON decisions(passed, created_utc);")
         self._try_exec("CREATE INDEX IF NOT EXISTS idx_decisions_passed_decided ON decisions(passed, decided_utc);")
         self._try_exec("CREATE INDEX IF NOT EXISTS idx_alerts_obj_cand_topic ON alerts(object_id, candid, topic);")
@@ -221,21 +214,15 @@ class DB:
     # -------------------------
 
     def add_alert(self, object_id: str, candid: str, topic: str, raw_json: Dict[str, Any]) -> None:
-        """
-        Store raw alert JSON. Works for legacy DB too (writes into payload_json if needed).
-        """
         now = _utcnow_iso()
         js = json.dumps(raw_json, separators=(",", ":"), sort_keys=False)
 
-        # legacy schema has id PK; we insert a row (and also try to update latest if possible)
         if self._has_column("alerts", "payload_json"):
-            # Prefer UPDATE then INSERT if no row
             cur = self._con.execute(
                 "UPDATE alerts SET payload_json=?, created_utc=? WHERE object_id=? AND candid=? AND topic=?",
                 (js, now, str(object_id), str(candid), str(topic)),
             )
             if cur.rowcount == 0:
-                # emitted_jd/received_utc are NOT known here -> best effort
                 emitted_jd = 0.0
                 received_utc = now
                 self._con.execute(
@@ -243,7 +230,6 @@ class DB:
                     (str(object_id), str(candid), str(topic), float(emitted_jd), str(received_utc), js, now),
                 )
         else:
-            # new schema
             self._con.execute(
                 """
                 INSERT INTO alerts(object_id, candid, topic, raw_json, created_utc)
@@ -254,7 +240,6 @@ class DB:
                 (str(object_id), str(candid), str(topic), js, now),
             )
 
-        # if we have raw_json col as well, keep it in sync
         if self._has_column("alerts", "raw_json"):
             self._con.execute(
                 "UPDATE alerts SET raw_json=? WHERE object_id=? AND candid=? AND topic=?",
@@ -272,15 +257,11 @@ class DB:
         reason: str,
         metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Store decision. For legacy DB: writes decided_utc + created_utc.
-        """
         now = _utcnow_iso()
         metrics = metrics or {}
         mjs = json.dumps(metrics, separators=(",", ":"), sort_keys=False)
 
         if self._has_column("decisions", "decided_utc"):
-            # legacy
             cur = self._con.execute(
                 "UPDATE decisions SET decided_utc=?, passed=?, reason=?, metrics_json=?, created_utc=? WHERE object_id=? AND candid=? AND topic=?",
                 (now, 1 if passed else 0, str(reason), mjs, now, str(object_id), str(candid), str(topic)),
@@ -291,7 +272,6 @@ class DB:
                     (str(object_id), str(candid), str(topic), now, 1 if passed else 0, str(reason), mjs, now),
                 )
         else:
-            # new schema
             self._con.execute(
                 """
                 INSERT INTO decisions(object_id, candid, topic, passed, reason, metrics_json, created_utc)
@@ -318,15 +298,10 @@ class DB:
         reply_json: Optional[Dict[str, Any]] = None,
         outcome: Optional[str] = None,
     ) -> None:
-        """
-        Record an action taken with TNS for a candidate.
-        Compatible with legacy tns_actions schema too.
-        """
         now = _utcnow_iso()
         rj = None if reply_json is None else json.dumps(reply_json, separators=(",", ":"), sort_keys=False)
 
         if self._has_column("tns_actions", "action_utc"):
-            # legacy schema: (object_id,candid,action_utc,action,outcome,detail,detail_json,created_utc)
             self._con.execute(
                 """
                 INSERT INTO tns_actions(object_id, candid, action_utc, action, outcome, detail, detail_json, created_utc)
@@ -344,7 +319,6 @@ class DB:
                 ),
             )
         else:
-            # new schema
             self._con.execute(
                 """
                 INSERT INTO tns_actions(object_id, candid, action, report_id, detail, reply_json, created_utc)
@@ -369,17 +343,18 @@ class DB:
 
     def was_submitted_or_skipped(self, object_id: str, candid: str) -> bool:
         """
-        True if an action already exists that indicates we handled this candidate.
-        Works with both schemas:
-        - new: action in ('submitted','skipped')
-        - legacy: action or outcome may carry those strings (depends on your older code)
+        Stability fix:
+        - ONLY treat successful submission as 'handled'.
+        - Do NOT treat "skipped"/"failed" as handled; those must be retryable after auth/code fixes.
+
+        If you ever want a permanent skip, use action='skipped_permanent' (optional).
         """
         obj = str(object_id)
         cand = str(candid)
 
-        clauses = ["(action IN ('submitted','skipped'))"]
+        clauses = ["(action IN ('submitted','skipped_permanent'))"]
         if self._tns_has_outcome:
-            clauses.append("(outcome IN ('submitted','skipped'))")
+            clauses.append("(outcome IN ('submitted','skipped_permanent'))")
 
         where_extra = " OR ".join(clauses)
         row = self._con.execute(
@@ -394,7 +369,6 @@ class DB:
 
     def _get_alert_json(self, object_id: str, candid: str, topic: str) -> Optional[Dict[str, Any]]:
         col = self._alerts_json_col
-        # defensive: if selected column is missing, try payload_json
         if not self._has_column("alerts", col):
             col = "payload_json" if self._has_column("alerts", "payload_json") else col
 
@@ -412,18 +386,11 @@ class DB:
         max_rows: int,
         topic: Optional[str] = None,
     ) -> List[DispatchCandidate]:
-        """
-        Return candidates that:
-        - have a decision passed=1 within the time window (uses decided_utc on legacy DB)
-        - have an alert JSON stored for the same (object_id,candid,topic)
-        - have NOT already been submitted/skipped
-        """
         since_dt = datetime.now(timezone.utc) - timedelta(hours=float(since_hours))
         since_iso = since_dt.replace(microsecond=0).isoformat()
 
         time_col = self._decisions_time_col
         if not self._has_column("decisions", time_col):
-            # last fallback
             time_col = "created_utc" if self._has_column("decisions", "created_utc") else "decided_utc"
 
         params: List[Any] = [since_iso]
@@ -432,7 +399,6 @@ class DB:
             topic_sql = " AND d.topic=? "
             params.append(str(topic))
 
-        # We may have duplicates in legacy DB; order by time desc and de-dup in Python.
         rows = self._con.execute(
             f"""
             SELECT d.object_id, d.candid, d.topic, d.reason, d.metrics_json, d.{time_col} AS decision_time
@@ -443,7 +409,7 @@ class DB:
             ORDER BY d.{time_col} DESC
             LIMIT ?
             """,
-            (*params, int(max_rows) * 10),  # fetch extra; we'll de-dup + filter
+            (*params, int(max_rows) * 10),
         ).fetchall()
 
         out: List[DispatchCandidate] = []
@@ -499,5 +465,4 @@ class DB:
             self._con.close()
 
 
-# Backwards-compatible alias
 AlertDB = DB

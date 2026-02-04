@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $repo
 
-# Logs SIEMPRE en ProgramData (Task Scheduler tiene permisos ahí)
+# Logs en ProgramData
 $base = "C:\ProgramData\FirstLight"
 $logsDir = Join-Path $base "logs\scheduler"
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
@@ -21,7 +21,7 @@ $errLog = Join-Path $logsDir ("night_" + $ts + ".err.log")
 $ps = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 $night = Join-Path $repo "scripts\run_night.ps1"
 
-# >>> AJUSTA AQUÍ a tu venv real (tú ya lo tienes)
+# Ajusta a tu venv real
 $pythonExe = "C:\Users\Tricejer\Desktop\FirstlightTest\.venv\Scripts\python.exe"
 $finkExe   = "C:\Users\Tricejer\Desktop\FirstlightTest\.venv\Scripts\fink_consumer.exe"
 

@@ -1,13 +1,13 @@
 # src/firstlight/tns/dispatch.py
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..storage.db import FirstlightDB
-from .client import TNSClient  # tu cliente actual
+from .client import TNSClient
+
 
 @dataclass
 class DispatchItem:
@@ -17,8 +17,10 @@ class DispatchItem:
     score: Optional[float]
     alert_json: Dict[str, Any]
 
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def dispatch_sandbox(
     db_path: str,
@@ -30,8 +32,17 @@ def dispatch_sandbox(
     """
     Devuelve una lista de resultados (dict) para logging/tests.
     """
-    client = TNSClient.from_env()  # usa TNS_API_URL sandbox en tu .env
+    client = TNSClient.from_env()
     db = FirstlightDB(db_path)
+
+    # Preflight auth hard-stop on fatal auth
+    ok_auth, detail_auth, _raw_auth = client.test_auth()
+    if not ok_auth:
+        return [{
+            "ok": False,
+            "action": "ABORT",
+            "detail": f"TNS auth preflight failed: {detail_auth}",
+        }]
 
     since_dt = _utcnow() - timedelta(hours=float(since_hours))
     candidates = db.get_dispatch_candidates(since_dt=since_dt, limit=int(max_submit))
@@ -52,11 +63,30 @@ def dispatch_sandbox(
             })
             continue
 
-        # Construir payload TNS desde el alert Fink
-        # Si tu TNSClient tiene build_at_report_from_fink_payload, úsalo:
         payload = client.build_at_report_from_fink_payload(it)
 
         ok, detail, objname, reply_json = client.submit_and_reply(payload, wait_s=wait_s)
+
+        # Abort quickly if auth is broken mid-run
+        if "fatal=auth" in str(detail):
+            db.add_tns_action(
+                object_id=objid,
+                candid=str(candid) if candid is not None else None,
+                action="submit_sandbox",
+                ok=False,
+                detail=f"auth_fatal: {detail}",
+                objname=None,
+                reply_json=reply_json,
+            )
+            out.append({
+                "objectId": objid,
+                "candid": candid,
+                "score": score,
+                "ok": False,
+                "detail": f"AUTH_FATAL: {detail}",
+                "objname": None,
+            })
+            break
 
         db.add_tns_action(
             object_id=objid,

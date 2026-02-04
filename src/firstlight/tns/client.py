@@ -78,14 +78,17 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _choose_filter_ids(fid: int, phot_filterid_env: str, nondet_filter_value_env: str) -> Tuple[Optional[str], Optional[str]]:
+def _choose_filter_ids(
+    fid: int,
+    phot_filterid_env: str,
+    nondet_filter_value_env: str
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Fix for your bug:
-      If env var is 'auto', we MUST NOT send 'auto' to TNS.
-      We instead map fid -> proper numeric filter ids.
+    If env var is 'auto', we MUST NOT send 'auto' to TNS.
+    We instead map fid -> proper numeric filter ids.
 
     ZTF fid: 1=g, 2=r, 3=i
-    Common TNS AUX mapping used in your salvage branch: 110/111/112
+    Common TNS AUX mapping used in your branch: 110/111/112
     """
     ztf_map = {1: "110", 2: "111", 3: "112"}
 
@@ -163,6 +166,12 @@ class TNSClient:
         self.photometry_filterid = _env("TNS_PHOT_FILTERID", "")
         self.nondet_filter_value = _env("TNS_NONDET_FILTER_VALUE", "")
 
+        # Reporter name shown in discovery certificate text ("<reporter> report/s ...")
+        self.reporter = _env("TNS_REPORTER", "") or _env("TNS_REPORTER_NAME", "") or "Firstlight"
+
+        # Option B: submission mode selector (auto|form|multipart|json)
+        self.submit_mode = (_env("TNS_SUBMIT_MODE", "auto") or "auto").strip().lower()
+
     @classmethod
     def from_env(cls) -> "TNSClient":
         api_base_url = _env("TNS_API_URL")
@@ -182,6 +191,78 @@ class TNSClient:
         timeout_s = _env_int("TNS_TIMEOUT_S", 30)
         return cls(api_base_url=api_base_url, api_key=api_key, user_agent=user_agent, timeout_s=timeout_s)
 
+    # -------------------------
+    # Preflight auth (NO spam)
+    # -------------------------
+
+    def test_auth(self) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        Best-effort auth preflight using /test (no spam).
+
+        Rules:
+        - If ANY attempt returns 200 with id_code=200 => ok=True
+        - If ANY attempt returns 401 => ok=False (auth broken for this endpoint)
+        - If all attempts are 404/405 => ok=True but "unsupported"
+        - Otherwise => ok=False (strict)
+
+        IMPORTANT: Some TNS deployments restrict /test even if /set/bulk-report works.
+        This is why the CLI must treat this as advisory only.
+        """
+        attempts: List[TNSResponse] = []
+
+        try:
+            attempts.append(self._get_params(self.test_url, {"api_key": self.api_key}, "test:GET(params)"))
+        except Exception:
+            pass
+        try:
+            attempts.append(self._post_form(self.test_url, {"api_key": self.api_key}, "test:form(api_key)"))
+        except Exception:
+            pass
+        try:
+            attempts.append(self._post_json(self.test_url, {"api_key": self.api_key}, "test:json(api_key)"))
+        except Exception:
+            pass
+
+        if not attempts:
+            return False, "preflight=failed (no test attempts could be made)", None
+
+        any_ok = any(a.http == 200 and str(a.id_code) == "200" for a in attempts)
+        any_401 = any(a.http == 401 for a in attempts)
+        all_unsupported = all(a.http in (404, 405) for a in attempts)
+
+        summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
+        raw = next((a.raw_json for a in attempts if isinstance(a.raw_json, dict)), None)
+
+        if any_ok:
+            best = next(a for a in attempts if a.http == 200 and str(a.id_code) == "200")
+            detail = (
+                f"preflight=ok via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
+                f"id_code={best.id_code} id_message={best.id_message} "
+                f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            )
+            return True, detail, (best.raw_json or {})
+
+        if any_401:
+            detail = (
+                f"preflight=fatal_auth (saw http=401) ({summary}) "
+                f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            )
+            return False, detail, (raw or {})
+
+        if all_unsupported:
+            return True, f"preflight=unsupported (/test returned 404/405) ({summary})", (raw or None)
+
+        best = attempts[0]
+        detail = (
+            f"preflight=failed http={best.http} id_code={best.id_code} id_message={best.id_message} "
+            f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+        )
+        return False, detail, (raw or {})
+
+    # -------------------------
+    # Payload builders
+    # -------------------------
+
     def build_submit_min_payload(self) -> Dict[str, Any]:
         discovery_dt = _utc_now_str_ms()
         nondet_dt = _utc_str_ms_offset(-86400)
@@ -192,7 +273,7 @@ class TNSClient:
 
         at_entry: Dict[str, Any] = {
             "internal_name": internal_name,
-            "reporter": "Firstlight Bot Test",
+            "reporter": self.reporter,
             "ra": {"value": ra_deg},
             "dec": {"value": dec_deg},
             "discovery_datetime": discovery_dt,
@@ -215,7 +296,6 @@ class TNSClient:
         if self.instrumentid:
             phot0["instrumentid"] = str(self.instrumentid)
 
-        # IMPORTANT: if env is "auto", do NOT send "auto" => map fid=2 -> 111
         phot_filterid, _ = _choose_filter_ids(2, self.photometry_filterid or "auto", self.nondet_filter_value or "auto")
         if phot_filterid:
             phot0["filterid"] = str(phot_filterid)
@@ -240,10 +320,6 @@ class TNSClient:
         return {"at_report": {"0": at_entry}}
 
     def build_at_report_from_fink_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Builds an AT report payload from a Fink alert payload.
-        This is required by `tns dispatch-sandbox`.
-        """
         if not isinstance(payload, dict):
             raise ValueError("payload must be dict")
         if "objectId" not in payload or "candidate" not in payload:
@@ -267,7 +343,6 @@ class TNSClient:
 
         discovery_dt = _fmt_tns_dt(jd_to_datetime_utc(jd))
 
-        # Non-detection best-effort, else jd-1 day
         nd_jd = None
         nd_lim = None
 
@@ -302,7 +377,7 @@ class TNSClient:
 
         at_entry: Dict[str, Any] = {
             "internal_name": internal_name,
-            "reporter": "Firstlight",
+            "reporter": self.reporter,
             "ra": {"value": f"{ra:.6f}"},
             "dec": {"value": f"{dec:.6f}"},
             "discovery_datetime": discovery_dt,
@@ -344,6 +419,10 @@ class TNSClient:
         at_entry["non_detection"] = nd
 
         return {"at_report": {"0": at_entry}}
+
+    # -------------------------
+    # HTTP primitives
+    # -------------------------
 
     def _post_form(self, url: str, form: Dict[str, str], method_tag: str) -> TNSResponse:
         t0 = time.time()
@@ -396,6 +475,25 @@ class TNSClient:
             method=method_tag,
         )
 
+    def _exc_response(self, method_tag: str, exc: Exception) -> TNSResponse:
+        # http=0 marks "client-side exception" (no HTTP response).
+        msg = (str(exc) or exc.__class__.__name__)[:240]
+        return TNSResponse(
+            ok=False,
+            http=0,
+            elapsed_ms=0,
+            id_code="exception",
+            id_message=msg,
+            report_id=None,
+            raw_json=None,
+            raw_text_snip=msg,
+            method=method_tag,
+        )
+
+    # -------------------------
+    # Diagnostics
+    # -------------------------
+
     def envcheck_dict(self, show_ua: bool = False) -> Dict[str, Any]:
         warnings: List[str] = []
         if not self.reporting_groupid:
@@ -404,6 +502,8 @@ class TNSClient:
             warnings.append("TNS_PHOT_FILTERID is empty (will omit photometry.filterid; set a real filter ID).")
         if not self.nondet_filter_value:
             warnings.append("TNS_NONDET_FILTER_VALUE is empty (will omit non_detection.filter_value; set a real filter ID).")
+        if not self.reporter:
+            warnings.append("TNS_REPORTER is empty (will fallback to 'Firstlight').")
 
         d = {
             "api_base_url": self.api_base_url,
@@ -413,12 +513,14 @@ class TNSClient:
             "test_url": self.test_url,
             "ua_stats": _stats_ua(self.user_agent),
             "timeout_s": self.timeout_s,
+            "submit_mode": self.submit_mode,
             "tns_ids_stats": (
                 f"reporting_groupid={self.reporting_groupid!r} "
                 f"discovery_data_sourceid={self.discovery_data_sourceid!r} "
                 f"instrumentid={self.instrumentid!r} "
                 f"phot_flux_units={self.photometry_flux_units!r} nondet_flux_units={self.nondet_flux_units!r} "
-                f"phot_filterid={self.photometry_filterid!r} nondet_filter_value={self.nondet_filter_value!r}"
+                f"phot_filterid={self.photometry_filterid!r} nondet_filter_value={self.nondet_filter_value!r} "
+                f"reporter={self.reporter!r}"
             ),
             "warnings": warnings,
         }
@@ -426,22 +528,95 @@ class TNSClient:
             d["user_agent"] = self.user_agent
         return d
 
+    # -------------------------
+    # Submit / reply
+    # -------------------------
+
     def submit_raw(self, payload: Dict[str, Any]) -> Tuple[bool, str, Optional[Any], Optional[Dict[str, Any]]]:
+        """
+        Option B (fix): try methods in-order and STOP at first ok.
+        This prevents "401 Unauthorized" from later fallbacks polluting the detail string
+        when an earlier method already succeeded (rid assigned).
+        """
         data_jsonstr = json.dumps(payload)
 
+        def do_form() -> TNSResponse:
+            return self._post_form(
+                self.submit_url,
+                {"api_key": self.api_key, "data": data_jsonstr},
+                "submit:form(api_key,data=jsonstr)",
+            )
+
+        def do_multipart() -> TNSResponse:
+            return self._post_multipart(
+                self.submit_url,
+                {"api_key": self.api_key},
+                {"data": (None, data_jsonstr)},
+                "submit:multipart(api_key in data, data as part)",
+            )
+
+        def do_json() -> TNSResponse:
+            return self._post_json(
+                self.submit_url,
+                {"api_key": self.api_key, "data": payload},
+                "submit:json(api_key,data_obj)",
+            )
+
+        # Mode selection (auto is safest: form -> multipart -> json)
+        mode = (self.submit_mode or "auto").strip().lower()
+        if mode not in ("auto", "form", "multipart", "json"):
+            mode = "auto"
+
+        chain: List[Tuple[str, Any]] = []
+        if mode == "form":
+            chain = [("form", do_form)]
+        elif mode == "multipart":
+            chain = [("multipart", do_multipart)]
+        elif mode == "json":
+            chain = [("json", do_json)]
+        else:
+            chain = [("form", do_form), ("multipart", do_multipart), ("json", do_json)]
+
         attempts: List[TNSResponse] = []
-        attempts.append(self._post_form(self.submit_url, {"api_key": self.api_key, "data": data_jsonstr}, "submit:form(api_key,data=jsonstr)"))
-        attempts.append(self._post_multipart(self.submit_url, {"api_key": self.api_key}, {"data": (None, data_jsonstr)}, "submit:multipart(api_key in data, data as part)"))
-        attempts.append(self._post_json(self.submit_url, {"api_key": self.api_key, "data": payload}, "submit:json(api_key,data_obj)"))
+        best: Optional[TNSResponse] = None
 
-        best = next((a for a in attempts if a.http == 200 and str(a.id_code) == "200"), attempts[0])
+        for _name, fn in chain:
+            try:
+                a = fn()
+            except Exception as exc:
+                a = self._exc_response(f"submit:{_name}(exception)", exc)
 
-        summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}:rid={a.report_id}" for a in attempts])
+            attempts.append(a)
+
+            # STOP on first success (critical)
+            if a.ok:
+                best = a
+                break
+
+        if best is None:
+            # no ok found: pick first attempt if exists, else synthetic error
+            best = attempts[0] if attempts else self._exc_response("submit:none", RuntimeError("no submit attempts"))
+
+        # Only summarize what we actually ran (no hidden 401 from unneeded fallbacks)
+        summary = " | ".join(
+            [f"{a.method}:{a.http}:{a.id_code}:{a.id_message}:rid={a.report_id}" for a in attempts]
+        )
+
+        all401 = (len(attempts) > 0) and all(a.http == 401 for a in attempts)
+        flags: List[str] = []
+        if all401:
+            flags.append("fatal=auth")
+
+        # If ok, label explicitly ok to help downstream classification
+        status = "ok" if best.ok else "failed"
+
         detail = (
-            f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
+            f"submit_status={status} via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
             f"id_code={best.id_code} id_message={best.id_message} report_id={best.report_id} "
-            f"({summary}) "
-            f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            f"(attempts={len(attempts)} {summary}) "
+            f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}"
+            + (f" {' '.join(flags)}" if flags else "")
+            + "]"
         )
         return best.ok, detail, best.report_id, best.raw_json
 
@@ -472,10 +647,21 @@ class TNSClient:
             if all(a.http == 401 for a in attempts):
                 attempts += one_round(self.reply_url_alt)
 
+            all401 = all(a.http == 401 for a in attempts)
+
             best = next((a for a in attempts if a.http == 200 and isinstance(a.raw_json, dict)), None)
             if best is None:
                 non401 = [a for a in attempts if a.http != 401]
                 best = non401[0] if non401 else attempts[0]
+
+            if all401:
+                summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
+                detail = (
+                    f"via={best.method} http=401 elapsed_ms={best.elapsed_ms} "
+                    f"id_code={best.id_code} id_message={best.id_message} tries={tries} fatal=auth "
+                    f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+                )
+                return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
 
             if best.http == 200 and isinstance(best.raw_json, dict):
                 ok = str(best.raw_json.get("id_code")) == "200"
@@ -486,7 +672,6 @@ class TNSClient:
                 )
                 return ok, detail, best.raw_json
 
-            # Common on TNS: reply endpoint returns 404 until processing is done.
             if best.http == 404 and time.time() < deadline:
                 time.sleep(max(1, int(poll_s)))
                 continue
@@ -498,7 +683,9 @@ class TNSClient:
             )
             return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
 
-    def submit_and_reply(self, payload: Dict[str, Any], wait_s: int = 600, poll_s: int = 10) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
+    def submit_and_reply(
+        self, payload: Dict[str, Any], wait_s: int = 600, poll_s: int = 10
+    ) -> Tuple[bool, str, Optional[str], Dict[str, Any]]:
         ok_s, detail_s, report_id, submit_json = self.submit_raw(payload)
         if not ok_s or report_id is None:
             return (
