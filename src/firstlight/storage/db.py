@@ -24,8 +24,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return _utcnow().replace(microsecond=0).isoformat()
 
 
 def _is_legacy_epoch(s: Optional[str]) -> bool:
@@ -53,6 +57,25 @@ class DispatchCandidate:
     decision_reason: str
     decision_metrics: Dict[str, Any]
     decision_created_utc: str
+
+    @property
+    def decision_score(self) -> Optional[float]:
+        """
+        Compatibility helper:
+        - Older / other modules may expect a .decision_score attribute.
+        - We derive it from decision_metrics if present, otherwise None.
+        """
+        if not isinstance(self.decision_metrics, dict):
+            return None
+
+        for k in ("decision_score", "score", "rank_score", "decisionScore"):
+            if k in self.decision_metrics:
+                v = self.decision_metrics.get(k)
+                try:
+                    return None if v is None else float(v)
+                except Exception:
+                    return None
+        return None
 
 
 class DB:
@@ -185,7 +208,9 @@ class DB:
             mn = (row["mn"] if row else None)
             mx = (row["mx"] if row else None)
             if _is_legacy_epoch(mn) and _is_legacy_epoch(mx):
-                self._try_exec("UPDATE decisions SET created_utc = decided_utc WHERE created_utc LIKE '1970-01-01T00:00:00%';")
+                self._try_exec(
+                    "UPDATE decisions SET created_utc = decided_utc WHERE created_utc LIKE '1970-01-01T00:00:00%';"
+                )
 
         if decisions_has_decided:
             row2 = self._con.execute("SELECT MIN(created_utc) AS mn, MAX(created_utc) AS mx FROM decisions").fetchone()
@@ -382,12 +407,35 @@ class DB:
 
     def iter_dispatch_candidates(
         self,
-        since_hours: float,
-        max_rows: int,
+        since_hours: Optional[float] = None,
+        max_rows: int = 1000,
         topic: Optional[str] = None,
+        *,
+        since_dt: Optional[datetime] = None,
     ) -> List[DispatchCandidate]:
-        since_dt = datetime.now(timezone.utc) - timedelta(hours=float(since_hours))
-        since_iso = since_dt.replace(microsecond=0).isoformat()
+        """
+        Returns candidates that:
+          - have passed decision (passed=1)
+          - are newer than the given lower bound (since_dt or since_hours)
+          - have not been successfully submitted (or permanently skipped)
+
+        Backward compatibility:
+          - Old callers can keep using (since_hours, max_rows, topic)
+          - New callers may use since_dt=... with max_rows=...
+        """
+        if since_dt is not None and since_hours is not None:
+            raise ValueError("Use either since_dt or since_hours, not both")
+
+        if since_dt is None:
+            if since_hours is None:
+                raise ValueError("iter_dispatch_candidates requires since_dt or since_hours")
+            since_dt = _utcnow() - timedelta(hours=float(since_hours))
+
+        # Normalize tz / precision
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+        since_iso = since_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
         time_col = self._decisions_time_col
         if not self._has_column("decisions", time_col):
@@ -466,3 +514,58 @@ class DB:
 
 
 AlertDB = DB
+
+
+# ---------------------------------------------------------------------------
+# Compatibility wrapper
+# ---------------------------------------------------------------------------
+# Older modules (and some IDEs) expect a FirstlightDB name with helpers used by
+# early dispatch prototypes. The core implementation lives in DB.
+
+
+class FirstlightDB(DB):
+    """Backward-compatible alias of DB with a couple of convenience wrappers."""
+
+    def get_dispatch_candidates(self, since_dt: datetime, limit: int) -> List[Dict[str, Any]]:
+        """Return raw Fink payload dicts for dispatch.
+
+        Parameters
+        ----------
+        since_dt:
+            UTC datetime lower bound. If naive, it is assumed UTC.
+        limit:
+            Max number of candidates.
+        """
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+        since_hours = max(0.0, (_utcnow() - since_dt).total_seconds() / 3600.0)
+        cands = list(self.iter_dispatch_candidates(since_hours=since_hours, max_rows=int(limit)))
+        return [c.alert_json for c in cands]
+
+    def add_tns_action(
+        self,
+        object_id: str,
+        candid: Optional[str],
+        action: str,
+        ok: bool,
+        detail: str,
+        objname: Optional[str] = None,
+        reply_json: Optional[Dict[str, Any]] = None,
+        report_id: Optional[int] = None,
+    ) -> None:
+        """Compatibility wrapper for logging TNS actions."""
+        outcome = "ok" if ok else "failed"
+        detail2 = detail
+        if objname:
+            detail2 = f"{detail} | objname={objname}"
+
+        self.tns_log(
+            action=action,
+            object_id=object_id,
+            candid=candid,
+            report_id=report_id,
+            detail=detail2,
+            reply_json=reply_json,
+            outcome=outcome,
+        )

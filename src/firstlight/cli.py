@@ -1,3 +1,4 @@
+# src/firstlight/cli.py
 """
 CLI entrypoint for FirstLight.
 
@@ -8,8 +9,11 @@ Usage:
   python -m firstlight --env .env tns reply <REPORT_ID> [--raw]
   python -m firstlight --env .env tns dispatch-sandbox --db firstlight.sqlite --since-hours 24 --max-submit 3 [--dry-run]
 
-Notes:
-- `--env .env` is handled by python-dotenv if installed; otherwise the file is ignored.
+Exit codes (dispatch-sandbox):
+  0  -> OK (reply_failed may be warnings)
+  10 -> AUTH_FATAL (stop dispatching; fix env/api key)
+  11 -> RETRYABLE/FAIL (submit failures; retry later)
+  12 -> INTERNAL_ERROR
 """
 
 from __future__ import annotations
@@ -23,8 +27,8 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None  # type: ignore
 
-from firstlight.storage.db import DB
 from firstlight.tns.client import TNSClient
+from firstlight.tns.dispatch import dispatch_sandbox
 
 
 def _safe_json(obj: Any) -> str:
@@ -87,136 +91,64 @@ def _cmd_tns_reply(args: argparse.Namespace) -> int:
 
 def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
     """
-    Dispatch candidates stored in DB to TNS.
-
-    "Sandbox" here is only a naming convention: this uses whatever `TNS_API_URL`
-    is set in your env. You choose sandbox vs prod by the env.
-
     Stability rules:
-    - Never block the whole night waiting for replies.
-    - Stop early on obvious auth failures (fatal=auth / http=401 on submit).
-    - Always log what happened in tns_actions.
+    - Never block the whole night waiting for replies (short wait_s; hard timeout in run_night).
+    - Stop early on AUTH_FATAL (avoid spamming 401s).
+    - Retry later on transient submit failures (exit code != 0, but not auth fatal).
+    - Always log into tns_actions via DB.tns_log in dispatch.py.
     """
     _load_env(args.env)
-    c = TNSClient.from_env()
-    db = DB(args.db)
-
-    if not hasattr(c, "build_at_report_from_fink_payload"):
-        print("ERROR: TNSClient is missing build_at_report_from_fink_payload(). Update src/firstlight/tns/client.py.")
-        db.close()
-        return 2
-    if not hasattr(c, "submit_raw"):
-        print("ERROR: TNSClient is missing submit_raw(). Update src/firstlight/tns/client.py.")
-        db.close()
-        return 2
-    if not hasattr(c, "reply"):
-        print("ERROR: TNSClient is missing reply(). Update src/firstlight/tns/client.py.")
-        db.close()
-        return 2
 
     print(
         f"dispatch: db={args.db} since_hours={args.since_hours} max_submit={args.max_submit} "
-        f"topic={args.topic!r} dry_run={args.dry_run}"
+        f"topic={args.topic!r} dry_run={args.dry_run} skip_reply={args.skip_reply} wait_s={args.wait_s} poll_s={args.poll_s}"
     )
-    print(f"tns: api_base_url={c.api_base_url}")
 
-    # Preflight is advisory: some TNS deployments restrict /test.
-    ok_auth, detail_auth, _raw_auth = c.test_auth()
-    print(f"tns_preflight: ok={ok_auth} detail={detail_auth}")
-    if not ok_auth:
-        print("NOTE: /test is advisory only; continuing. Bulk submit will be the real auth check.")
+    try:
+        res = dispatch_sandbox(
+            db_path=args.db,
+            since_hours=args.since_hours,
+            max_submit=args.max_submit,
+            dry_run=bool(args.dry_run),
+            topic=args.topic,
+            skip_reply=bool(args.skip_reply),
+            wait_s=int(args.wait_s),
+            poll_s=int(args.poll_s),
+        )
+    except Exception as e:
+        print(f"INTERNAL_ERROR: {e}")
+        return 12
 
-    candidates = db.iter_dispatch_candidates(since_hours=args.since_hours, max_rows=args.max_submit, topic=args.topic)
-
-    submitted = 0
-    dry_skipped = 0
-    failed_submit = 0
-    reply_failed = 0
-    aborted_auth = False
-
-    for cand in candidates:
-        # Build payload
-        try:
-            payload = c.build_at_report_from_fink_payload(cand.alert_json)  # type: ignore[attr-defined]
-        except Exception as e:
-            failed_submit += 1
-            msg = f"build_payload_failed: {e}"
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: FAIL {msg}")
-            db.tns_log("skipped", cand.object_id, cand.candid, None, msg, None)
-            continue
-
-        if args.dry_run:
-            dry_skipped += 1
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: DRY_RUN (reason={cand.decision_reason})")
-            continue
-
-        # Submit only (do not let reply block the pipeline)
-        try:
-            ok_s, detail_s, report_id, submit_json = c.submit_raw(payload)  # type: ignore[attr-defined]
-        except Exception as e:
-            failed_submit += 1
-            msg = f"submit_exception: {e}"
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: FAIL {msg}")
-            db.tns_log("failed", cand.object_id, cand.candid, None, msg, None)
-            continue
-
-        # Hard-stop on auth failures to avoid spamming 401s all night
-        if ("fatal=auth" in str(detail_s)) or (" http=401" in str(detail_s)) or ("Unauthorized" in str(detail_s)):
-            failed_submit += 1
-            aborted_auth = True
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: FAIL AUTH detail={detail_s}")
-            db.tns_log("failed_auth", cand.object_id, cand.candid, report_id, f"auth_fatal: {detail_s}", submit_json)
-            break
-
-        if not ok_s or report_id is None:
-            failed_submit += 1
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: FAIL submit detail={detail_s}")
-            db.tns_log("failed", cand.object_id, cand.candid, report_id, detail_s, submit_json)
-            continue
-
-        # At this point, submit is OK -> record as submitted (even if we skip reply)
-        if args.skip_reply:
-            submitted += 1
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: OK report_id={report_id} (reply skipped)")
-            db.tns_log("submitted", cand.object_id, cand.candid, report_id, f"{detail_s} | reply: skipped", submit_json)
-            continue
-
-        # Reply is useful but can be flaky; keep it SHORT
-        try:
-            ok_r, detail_r, reply_json = c.reply(report_id=report_id, wait_s=args.wait_s, poll_s=args.poll_s)  # type: ignore[attr-defined]
-        except KeyboardInterrupt:
-            # Don't lose the fact that submit worked.
-            print("KeyboardInterrupt during reply polling. Submit was already OK; stopping gracefully.")
-            db.tns_log("submitted", cand.object_id, cand.candid, report_id, f"{detail_s} | reply: interrupted", submit_json)
-            aborted_auth = True
-            break
-        except Exception as e:
-            reply_failed += 1
-            msg = f"{detail_s} | reply_exception: {e}"
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: OK submit, WARN reply_failed report_id={report_id}")
-            db.tns_log("submitted", cand.object_id, cand.candid, report_id, msg, submit_json)
-            continue
-
-        if ok_r:
-            submitted += 1
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: OK report_id={report_id} detail={detail_s} | reply={detail_r}")
-            db.tns_log("submitted", cand.object_id, cand.candid, report_id, f"{detail_s} | reply: {detail_r}", reply_json)
+    # Print per-item (compact)
+    items = res.get("items", []) or []
+    for it in items:
+        objid = it.get("objectId")
+        candid = it.get("candid")
+        ok = it.get("ok")
+        detail = it.get("detail")
+        rid = it.get("report_id")
+        if rid is not None:
+            print(f"- {objid} candid={candid}: ok={ok} report_id={rid} detail={detail}")
         else:
-            reply_failed += 1
-            print(f"- {cand.object_id} candid={cand.candid} topic={cand.topic}: OK submit, WARN reply_failed report_id={report_id} reply_detail={detail_r}")
-            # Still mark as submitted: resubmitting later is usually worse (duplicate / spam).
-            db.tns_log("submitted", cand.object_id, cand.candid, report_id, f"{detail_s} | reply: {detail_r}", reply_json)
-
-    db.close()
+            print(f"- {objid} candid={candid}: ok={ok} detail={detail}")
 
     print(
-        f"done: candidates={len(candidates)} submitted={submitted} dry_skipped={dry_skipped} "
-        f"failed_submit={failed_submit} reply_failed={reply_failed}"
+        f"done: candidates={res.get('candidates')} submitted={res.get('submitted')} "
+        f"failed_submit={res.get('failed_submit')} reply_failed={res.get('reply_failed')} "
+        f"aborted_auth={res.get('aborted_auth')} aborted_transient={res.get('aborted_transient')} detail={res.get('detail')}"
     )
-    if aborted_auth:
-        print("NOTE: Dispatch stopped early (auth fatal or interrupted). Check TNS_API_KEY / env contamination.")
-    # Return non-zero only if submit failed or auth fatal; reply failures are warnings.
-    return 0 if (failed_submit == 0 and not aborted_auth) else 2
+
+    if res.get("aborted_auth"):
+        # Línea determinista para kill-switch y grep
+        print("AUTH_FATAL")
+        print("NOTE: AUTH_FATAL detected -> stop dispatching and fix .env / API key.")
+        return 10
+
+    if (res.get("failed_submit") or 0) > 0 or res.get("aborted_transient"):
+        # Retry later (run_night will backoff)
+        return 11
+
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -257,8 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dispatch.add_argument("--max-submit", type=int, default=3, help="Max number of candidates to submit")
     p_dispatch.add_argument("--topic", default=None, help="Optional topic filter (e.g. n1). If omitted, any topic.")
     p_dispatch.add_argument("--dry-run", action="store_true", help="Do not submit; just print what would be done")
-    # Reply controls (kept short by default in practice; use skip-reply for full stability)
-    p_dispatch.add_argument("--skip-reply", action="store_true", help="Do not poll reply; submit only (most stable)")
+    p_dispatch.add_argument("--skip-reply", action="store_true", help="Submit only; do not poll reply (most stable)")
     p_dispatch.add_argument("--wait-s", type=int, default=60, help="Max time to wait for reply after submit (seconds)")
     p_dispatch.add_argument("--poll-s", type=int, default=5, help="Polling interval while waiting (seconds)")
     p_dispatch.set_defaults(func=_cmd_tns_dispatch_sandbox)

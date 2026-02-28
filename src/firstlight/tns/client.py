@@ -1,3 +1,4 @@
+# src/firstlight/tns/client.py
 import json
 import os
 import time
@@ -192,70 +193,80 @@ class TNSClient:
         return cls(api_base_url=api_base_url, api_key=api_key, user_agent=user_agent, timeout_s=timeout_s)
 
     # -------------------------
-    # Preflight auth (NO spam)
+    # Preflight auth (NO spam, NO false fatal)
     # -------------------------
 
     def test_auth(self) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """
-        Best-effort auth preflight using /test (no spam).
+        Robust auth preflight.
 
-        Rules:
-        - If ANY attempt returns 200 with id_code=200 => ok=True
-        - If ANY attempt returns 401 => ok=False (auth broken for this endpoint)
-        - If all attempts are 404/405 => ok=True but "unsupported"
-        - Otherwise => ok=False (strict)
+        Why:
+          - /test is NOT reliable in some deployments (can 401/403 even when submit/reply work).
+          - What matters is: can we authenticate against the endpoints we actually use?
 
-        IMPORTANT: Some TNS deployments restrict /test even if /set/bulk-report works.
-        This is why the CLI must treat this as advisory only.
+        Strategy:
+          - Probe bulk-report-reply with a dummy report_id ("0") using POST form (the method that works for reply).
+          - Optionally probe the alternate reply URL if the primary looks unsupported (404/405).
+          - Mark AUTH_FATAL only on 401/403.
+          - Any other HTTP response means "auth accepted but report not found / method unsupported" => ok=True.
+
+        Returns:
+          ok=True  => safe to run dispatch (auth is not fatal)
+          ok=False => fatal auth (401/403) OR client-side error (no HTTP)
         """
         attempts: List[TNSResponse] = []
+        dummy_rid = "0"
 
-        try:
-            attempts.append(self._get_params(self.test_url, {"api_key": self.api_key}, "test:GET(params)"))
-        except Exception:
-            pass
-        try:
-            attempts.append(self._post_form(self.test_url, {"api_key": self.api_key}, "test:form(api_key)"))
-        except Exception:
-            pass
-        try:
-            attempts.append(self._post_json(self.test_url, {"api_key": self.api_key}, "test:json(api_key)"))
-        except Exception:
-            pass
+        def probe(url: str, tag: str) -> TNSResponse:
+            # minimal, deterministic probe (no schema side effects)
+            return self._post_form(url, {"api_key": self.api_key, "report_id": dummy_rid}, tag)
 
-        if not attempts:
-            return False, "preflight=failed (no test attempts could be made)", None
+        # primary probe (1 request)
+        try:
+            attempts.append(probe(self.reply_url, "preflight:reply:form(primary)"))
+        except Exception as exc:
+            attempts.append(self._exc_response("preflight:reply:form(primary,exception)", exc))
 
-        any_ok = any(a.http == 200 and str(a.id_code) == "200" for a in attempts)
-        any_401 = any(a.http == 401 for a in attempts)
-        all_unsupported = all(a.http in (404, 405) for a in attempts)
+        # if primary looks "unsupported", try alt (at most 1 extra request)
+        if attempts and attempts[0].http in (404, 405):
+            try:
+                attempts.append(probe(self.reply_url_alt, "preflight:reply:form(alt)"))
+            except Exception as exc:
+                attempts.append(self._exc_response("preflight:reply:form(alt,exception)", exc))
+
+        # classify
+        any_fatal = any(a.http in (401, 403) for a in attempts)
+        any_http = any(a.http != 0 for a in attempts)
+        any_ok200 = any(a.http == 200 and str(a.id_code) == "200" for a in attempts)
 
         summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
         raw = next((a.raw_json for a in attempts if isinstance(a.raw_json, dict)), None)
 
-        if any_ok:
-            best = next(a for a in attempts if a.http == 200 and str(a.id_code) == "200")
+        if any_fatal:
+            # Use a single flag that downstream can detect safely.
             detail = (
-                f"preflight=ok via={best.method} http=200 elapsed_ms={best.elapsed_ms} "
+                f"preflight=fatal_auth fatal=auth ({summary}) "
+                f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            )
+            return False, detail, (raw or {})
+
+        # If we got ANY HTTP response that is not 401/403, auth is not fatal.
+        # 404 is expected for dummy report_id; 400 can happen too depending on API validation.
+        if any_http:
+            best = next((a for a in attempts if a.http != 0), attempts[0])
+            # NOTE: even if best.http is 404, that's a GOOD sign for auth.
+            status = "ok" if (any_ok200 or best.http in (200, 400, 404, 405, 422)) else "ok"
+            detail = (
+                f"preflight={status} via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
                 f"id_code={best.id_code} id_message={best.id_message} "
                 f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
             )
             return True, detail, (best.raw_json or {})
 
-        if any_401:
-            detail = (
-                f"preflight=fatal_auth (saw http=401) ({summary}) "
-                f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
-            )
-            return False, detail, (raw or {})
-
-        if all_unsupported:
-            return True, f"preflight=unsupported (/test returned 404/405) ({summary})", (raw or None)
-
-        best = attempts[0]
+        # no HTTP at all => local/network error (transient)
         detail = (
-            f"preflight=failed http={best.http} id_code={best.id_code} id_message={best.id_message} "
-            f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            f"preflight=error (no http response) ({summary}) "
+            f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
         )
         return False, detail, (raw or {})
 
@@ -509,6 +520,7 @@ class TNSClient:
             "api_base_url": self.api_base_url,
             "api_key_stats": _stats_api_key(self.api_key),
             "reply_url": self.reply_url,
+            "reply_url_alt": self.reply_url_alt,
             "submit_url": self.submit_url,
             "test_url": self.test_url,
             "ua_stats": _stats_ua(self.user_agent),
