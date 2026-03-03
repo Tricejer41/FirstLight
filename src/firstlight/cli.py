@@ -8,6 +8,7 @@ Usage:
   python -m firstlight --env .env tns submit-min
   python -m firstlight --env .env tns reply <REPORT_ID> [--raw]
   python -m firstlight --env .env tns dispatch-sandbox --db firstlight.sqlite --since-hours 24 --max-submit 3 [--dry-run]
+  python -m firstlight --env .env tns sweep-replies --db firstlight.sqlite --since-hours 24 --max 50
 
 Exit codes (dispatch-sandbox):
   0  -> OK (reply_failed may be warnings)
@@ -20,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 try:
@@ -89,6 +92,69 @@ def _cmd_tns_reply(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def _cmd_tns_sweep_replies(args: argparse.Namespace) -> int:
+    """
+    Fast morning sweep: checks replies for recently submitted report_id
+    without blocking nights (no long polling).
+    """
+    _load_env(args.env)
+    c = TNSClient.from_env()
+
+    db = args.db
+    since_hours = float(args.since_hours)
+    max_n = int(args.max)
+
+    cut = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).replace(microsecond=0).isoformat()
+
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(
+            """
+            select distinct report_id
+            from tns_actions
+            where created_utc>=?
+              and action='submitted'
+              and report_id is not null
+              and trim(report_id) != ''
+            order by created_utc desc
+            limit ?
+            """,
+            (cut, max_n),
+        ).fetchall()
+    finally:
+        con.close()
+
+    if not rows:
+        print(f"sweep-replies: no submitted report_id in last {since_hours}h")
+        return 0
+
+    fatal_auth = 0
+    ok_cnt = 0
+    pending_404 = 0
+    other_fail = 0
+
+    for (rid,) in rows:
+        ok, detail, _reply_json = c.reply_fast(rid)
+        print(f"- report_id={rid}: {detail}")
+
+        if "fatal=auth" in (detail or ""):
+            fatal_auth += 1
+        elif ok:
+            ok_cnt += 1
+        elif "not_ready http=404" in (detail or "") or "not_ready" in (detail or ""):
+            pending_404 += 1
+        else:
+            other_fail += 1
+
+    print(f"done: ok={ok_cnt} pending_404={pending_404} other_fail={other_fail} fatal_auth={fatal_auth}")
+
+    if fatal_auth:
+        return 10
+    if other_fail:
+        return 11
+    return 0
+
+
 def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
     """
     Stability rules:
@@ -119,18 +185,18 @@ def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
         print(f"INTERNAL_ERROR: {e}")
         return 12
 
-    # Print per-item (compact)
     items = res.get("items", []) or []
     for it in items:
         objid = it.get("objectId")
         candid = it.get("candid")
+        topic = it.get("topic")
         ok = it.get("ok")
         detail = it.get("detail")
         rid = it.get("report_id")
         if rid is not None:
-            print(f"- {objid} candid={candid}: ok={ok} report_id={rid} detail={detail}")
+            print(f"- {objid} candid={candid} topic={topic}: ok={ok} report_id={rid} detail={detail}")
         else:
-            print(f"- {objid} candid={candid}: ok={ok} detail={detail}")
+            print(f"- {objid} candid={candid} topic={topic}: ok={ok} detail={detail}")
 
     print(
         f"done: candidates={res.get('candidates')} submitted={res.get('submitted')} "
@@ -139,13 +205,11 @@ def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
     )
 
     if res.get("aborted_auth"):
-        # Línea determinista para kill-switch y grep
         print("AUTH_FATAL")
         print("NOTE: AUTH_FATAL detected -> stop dispatching and fix .env / API key.")
         return 10
 
     if (res.get("failed_submit") or 0) > 0 or res.get("aborted_transient"):
-        # Retry later (run_night will backoff)
         return 11
 
     return 0
@@ -179,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_reply.add_argument("--wait-s", type=int, default=600, help="Max time to wait for reply on 404 (seconds)")
     p_reply.add_argument("--poll-s", type=int, default=10, help="Polling interval while waiting (seconds)")
     p_reply.set_defaults(func=_cmd_tns_reply)
+
+    p_sweep = tns_sub.add_parser("sweep-replies", help="Fast sweep: check replies for recently submitted report_id")
+    p_sweep.add_argument("--db", required=True, help="Path to sqlite DB")
+    p_sweep.add_argument("--since-hours", type=float, default=24.0, help="Look back window (hours)")
+    p_sweep.add_argument("--max", type=int, default=50, help="Max report_id to check")
+    p_sweep.set_defaults(func=_cmd_tns_sweep_replies)
 
     p_dispatch = tns_sub.add_parser(
         "dispatch-sandbox",

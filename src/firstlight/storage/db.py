@@ -232,6 +232,11 @@ class DB:
         self._try_exec("CREATE INDEX IF NOT EXISTS idx_alerts_obj_cand_topic ON alerts(object_id, candid, topic);")
         self._try_exec("CREATE INDEX IF NOT EXISTS idx_tns_actions_obj_cand ON tns_actions(object_id, candid);")
 
+        # Production-friendly indexes (sweep replies / health checks)
+        self._try_exec("CREATE INDEX IF NOT EXISTS idx_tns_actions_created ON tns_actions(created_utc);")
+        self._try_exec("CREATE INDEX IF NOT EXISTS idx_tns_actions_action_created ON tns_actions(action, created_utc);")
+        self._try_exec("CREATE INDEX IF NOT EXISTS idx_tns_actions_report_id ON tns_actions(report_id);")
+
         self._con.commit()
 
     # -------------------------
@@ -516,26 +521,11 @@ class DB:
 AlertDB = DB
 
 
-# ---------------------------------------------------------------------------
-# Compatibility wrapper
-# ---------------------------------------------------------------------------
-# Older modules (and some IDEs) expect a FirstlightDB name with helpers used by
-# early dispatch prototypes. The core implementation lives in DB.
-
-
 class FirstlightDB(DB):
     """Backward-compatible alias of DB with a couple of convenience wrappers."""
 
     def get_dispatch_candidates(self, since_dt: datetime, limit: int) -> List[Dict[str, Any]]:
-        """Return raw Fink payload dicts for dispatch.
-
-        Parameters
-        ----------
-        since_dt:
-            UTC datetime lower bound. If naive, it is assumed UTC.
-        limit:
-            Max number of candidates.
-        """
+        """Return raw Fink payload dicts for dispatch."""
         if since_dt.tzinfo is None:
             since_dt = since_dt.replace(tzinfo=timezone.utc)
 

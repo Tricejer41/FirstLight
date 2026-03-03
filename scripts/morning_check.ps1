@@ -3,6 +3,7 @@
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1
 #   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1 -Db .\firstlight.sqlite -LogsRoot .\alertDB\logs -RawRoot .\alertDB\raw
+#   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1 -PythonExe .\.venv\Scripts\python.exe
 
 param(
   [string]$Db = ".\firstlight.sqlite",
@@ -17,7 +18,10 @@ param(
   [int]$DupTopN = 10,
 
   # Hours window for "recent" stats (default 24h, but configurable)
-  [int]$WindowHours = 24
+  [int]$WindowHours = 24,
+
+  # Python interpreter to use for inline scripts (avoid PATH drift)
+  [string]$PythonExe = ""
 )
 
 Set-StrictMode -Version Latest
@@ -43,12 +47,13 @@ function Print-Section([string]$title) {
 }
 
 # ---------------------------------------------------------------------------
-# Option B: Run python via a temp .py file (no python -c), so quoting is stable
+# Python runner: temp .py file (stable quoting) + explicit interpreter
 # ---------------------------------------------------------------------------
 function Invoke-PythonTempScript {
   param(
     [Parameter(Mandatory=$true)][string] $Code,
-    [Parameter(Mandatory=$false)][string[]] $Args = @()
+    [Parameter(Mandatory=$false)][string[]] $Args = @(),
+    [Parameter(Mandatory=$true)][string] $PyExe
   )
 
   $tmp = Join-Path $env:TEMP ("firstlight_inline_{0}.py" -f ([guid]::NewGuid().ToString("N")))
@@ -57,7 +62,7 @@ function Invoke-PythonTempScript {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($tmp, $Code, $utf8NoBom)
 
-    & python $tmp @Args
+    & $PyExe $tmp @Args
     if ($LASTEXITCODE -ne 0) {
       throw "Python exited with code $LASTEXITCODE"
     }
@@ -65,6 +70,20 @@ function Invoke-PythonTempScript {
   finally {
     Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
   }
+}
+
+# --- Resolve repo-root-ish python if not provided ---
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+  # assume scripts/ is under repo root
+  $repoRootGuess = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+  $venvPy = Join-Path $repoRootGuess ".venv\Scripts\python.exe"
+  if (Test-Path $venvPy) {
+    $PythonExe = (Resolve-Path $venvPy).Path
+  } else {
+    $PythonExe = (Get-Command python -ErrorAction Stop).Source
+  }
+} else {
+  if (Test-Path $PythonExe) { $PythonExe = (Resolve-Abs $PythonExe) }
 }
 
 # --- Resolve paths ---
@@ -78,9 +97,10 @@ $rawAbs = $RawRoot
 if (Test-Path $RawRoot) { $rawAbs = Resolve-Abs $RawRoot }
 
 Print-Section "Paths"
-Write-Host ("DB      : {0}" -f $dbAbs)
-Write-Host ("LogsRoot: {0}" -f $logsAbs)
-Write-Host ("RawRoot : {0}" -f $rawAbs)
+Write-Host ("DB       : {0}" -f $dbAbs)
+Write-Host ("LogsRoot : {0}" -f $logsAbs)
+Write-Host ("RawRoot  : {0}" -f $rawAbs)
+Write-Host ("PythonExe: {0}" -f $PythonExe)
 
 # --- Latest run dir ---
 $lastLogDir = Get-LatestRunDir $logsAbs
@@ -89,7 +109,15 @@ if (-not $lastLogDir) {
   Write-Host "No log directories found."
   exit 1
 }
-Write-Host ("Last log dir: {0} (LastWriteTime={1})" -f $lastLogDir.FullName, $lastLogDir.LastWriteTime)
+Write-Host ("Last log dir: {0} (DirLastWriteTime={1})" -f $lastLogDir.FullName, $lastLogDir.LastWriteTime)
+
+# Last activity inside dir
+$lastActivity = Get-ChildItem $lastLogDir.FullName -File -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+if ($lastActivity) {
+  Write-Host ("Last activity inside dir: {0}" -f $lastActivity.LastWriteTime)
+}
 
 # Show stop reason if present
 $stopReason = Join-Path $lastLogDir.FullName "_stop_reason.txt"
@@ -174,7 +202,7 @@ for ln in pathlib.Path(p).read_text(encoding='utf-8').splitlines():
         c[r] += 1
 print('reasons_top=', c.most_common(10))
 "@
-  Invoke-PythonTempScript -Code $py -Args @($replayJsonl)
+  Invoke-PythonTempScript -Code $py -Args @($replayJsonl) -PyExe $PythonExe
 } else {
   Write-Host "No replay.jsonl in latest run."
 }
@@ -195,26 +223,68 @@ hours = int(sys.argv[2])
 
 con = sqlite3.connect(db)
 
+def has_col(table, col):
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r[1] == col for r in rows)
+    except Exception:
+        return False
+
+def is_legacy_epoch(s):
+    if not s:
+        return True
+    return str(s).startswith("1970-01-01T00:00:00")
+
+def choose_decision_time_col():
+    has_created = has_col("decisions","created_utc")
+    has_decided = has_col("decisions","decided_utc")
+    if has_created and not has_decided:
+        return "created_utc"
+    if has_decided and not has_created:
+        return "decided_utc"
+    if has_created and has_decided:
+        row = con.execute("select min(created_utc), max(created_utc) from decisions").fetchone()
+        mn, mx = row[0], row[1]
+        if is_legacy_epoch(mn) and is_legacy_epoch(mx):
+            return "decided_utc"
+        return "created_utc"
+    return "created_utc"
+
 def cnt(q, params=()):
     try:
         return con.execute(q, params).fetchone()[0]
     except Exception:
         return None
 
-print('DB=', db)
-print('alerts=', cnt('select count(*) from alerts'))
-print('decisions=', cnt('select count(*) from decisions'))
-print('tns_actions=', cnt('select count(*) from tns_actions'))
+tcol = choose_decision_time_col()
+
+print("DB=", db)
+print("alerts=", cnt("select count(*) from alerts"))
+print("decisions=", cnt("select count(*) from decisions"))
+print("tns_actions=", cnt("select count(*) from tns_actions"))
+print("decisions_time_col=", tcol)
 
 cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).replace(microsecond=0).isoformat()
-print('cut_utc_window=', cut, '(hours=', hours, ')')
+print("cut_utc_window=", cut, "(hours=", hours, ")")
 
-print('alerts_window=', cnt('select count(*) from alerts where created_utc>=?', (cut,)))
-print('decisions_window=', cnt('select count(*) from decisions where created_utc>=?', (cut,)))
-print('passed_window=', cnt('select count(*) from decisions where created_utc>=? and passed=1', (cut,)))
-print('tns_actions_window=', cnt('select count(*) from tns_actions where created_utc>=?', (cut,)))
+print("alerts_window=", cnt("select count(*) from alerts where created_utc>=?", (cut,)))
+print("decisions_window=", cnt(f"select count(*) from decisions where {tcol}>=?", (cut,)))
+print("passed_window=", cnt(f"select count(*) from decisions where {tcol}>=? and passed=1", (cut,)))
+print("tns_actions_window=", cnt("select count(*) from tns_actions where created_utc>=?", (cut,)))
+
+# dispatchable: passed decisions not yet submitted/skipped_permanent
+dispatchable = cnt(f"""
+select count(*) from decisions d
+where d.passed=1 and d.{tcol}>=?
+and not exists (
+  select 1 from tns_actions a
+  where a.object_id=d.object_id and a.candid=d.candid
+    and a.action in ('submitted','skipped_permanent')
+)
+""", (cut,))
+print("dispatchable_window=", dispatchable)
 "@
-Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours")
+Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours") -PyExe $PythonExe
 
 # --- TNS actions health ---
 Print-Section "TNS actions (health)"
@@ -288,7 +358,7 @@ print('dups_window_top=', [(r['object_id'], r['candid'], r['action'], r['n']) fo
 passed = qone('select count(*) from decisions where created_utc>=? and passed=1', (cut,)) or 0
 acts   = qone('select count(*) from tns_actions where created_utc>=?', (cut,)) or 0
 ratio = (acts / passed) if passed else None
-print('passed_window=', passed, 'tns_actions_window=', acts, 'actions_per_passed=', ratio)
+print('passed_window(created_utc)=', passed, 'tns_actions_window=', acts, 'actions_per_passed=', ratio)
 
 np = qall('''
 select
@@ -321,6 +391,6 @@ for r in last:
     )
     print(line)
 "@
-Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours", "$DupTopN", "$TnsTail")
+Invoke-PythonTempScript -Code $py -Args @($dbAbs, "$WindowHours", "$DupTopN", "$TnsTail") -PyExe $PythonExe
 
 # End

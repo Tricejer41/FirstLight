@@ -87,7 +87,7 @@ def dispatch_sandbox(
             return summary
 
         since_dt = _utcnow() - timedelta(hours=float(since_hours))
-        candidates = db.iter_dispatch_candidates(since_dt=since_dt, max_rows=int(max_submit), topic=topic)
+        candidates = list(db.iter_dispatch_candidates(since_dt=since_dt, max_rows=int(max_submit), topic=topic))
         summary["candidates"] = len(candidates)
 
         if summary["candidates"] == 0:
@@ -99,13 +99,15 @@ def dispatch_sandbox(
 
         for cand in candidates:
             objid = cand.object_id
-            candid = str(cand.candid) if cand.candid is not None else None
+            candid = str(cand.candid) if cand.candid is not None else ""
+            topic_r = cand.topic
 
             if dry_run:
                 summary["items"].append(
                     {
                         "objectId": objid,
                         "candid": candid,
+                        "topic": topic_r,
                         "score": cand.decision_score,
                         "action": "DRY_RUN",
                         "reason": cand.decision_reason,
@@ -118,7 +120,7 @@ def dispatch_sandbox(
                 payload = client.build_at_report_from_fink_payload(cand.alert_json)
             except Exception as e:
                 summary["failed_submit"] += 1
-                msg = f"build_payload_failed: {e}"
+                msg = f"topic={topic_r} build_payload_failed: {e}"
                 db.tns_log(
                     action="skipped",
                     object_id=objid,
@@ -128,7 +130,7 @@ def dispatch_sandbox(
                     reply_json=None,
                     outcome="skip",
                 )
-                summary["items"].append({"objectId": objid, "candid": candid, "ok": False, "detail": msg})
+                summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": False, "detail": msg})
                 continue
 
             # Submit
@@ -136,7 +138,7 @@ def dispatch_sandbox(
                 ok_s, detail_s, report_id_any, submit_json = client.submit_raw(payload)
             except Exception as e:
                 summary["failed_submit"] += 1
-                msg = f"submit_exception: {e}"
+                msg = f"topic={topic_r} submit_exception: {e}"
                 db.tns_log(
                     action="failed",
                     object_id=objid,
@@ -146,7 +148,7 @@ def dispatch_sandbox(
                     reply_json=None,
                     outcome="fail",
                 )
-                summary["items"].append({"objectId": objid, "candid": candid, "ok": False, "detail": msg})
+                summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": False, "detail": msg})
                 consecutive_transient += 1
                 if consecutive_transient >= max_consecutive_transient:
                     summary["aborted_transient"] = True
@@ -157,7 +159,7 @@ def dispatch_sandbox(
             if _is_auth_fatal(str(detail_s)):
                 summary["failed_submit"] += 1
                 summary["aborted_auth"] = True
-                msg = f"auth_fatal: {detail_s}"
+                msg = f"topic={topic_r} auth_fatal: {detail_s}"
                 db.tns_log(
                     action="failed_auth",
                     object_id=objid,
@@ -167,31 +169,28 @@ def dispatch_sandbox(
                     reply_json=submit_json,
                     outcome="fail",
                 )
-                summary["items"].append({"objectId": objid, "candid": candid, "ok": False, "detail": msg})
+                summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": False, "detail": msg})
                 summary["detail"] = "auth fatal during submit"
                 break
 
-            # report_id a int si se puede
-            report_id: Optional[int] = None
-            try:
-                if report_id_any is not None and str(report_id_any).isdigit():
-                    report_id = int(str(report_id_any))
-            except Exception:
-                report_id = None
+            # Treat report_id as TEXT always (DB stores TEXT)
+            report_id_txt: Optional[str] = None
+            if report_id_any is not None:
+                report_id_txt = str(report_id_any).strip() or None
 
-            if not ok_s or report_id_any is None:
+            if not ok_s or report_id_txt is None:
                 summary["failed_submit"] += 1
-                msg = f"submit_failed: {detail_s}"
+                msg = f"topic={topic_r} submit_failed: {detail_s}"
                 db.tns_log(
                     action="failed",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
+                    report_id=report_id_txt,
                     detail=msg,
                     reply_json=submit_json,
                     outcome="fail",
                 )
-                summary["items"].append({"objectId": objid, "candid": candid, "ok": False, "detail": msg})
+                summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": False, "detail": msg})
 
                 if _is_transient(str(detail_s)):
                     consecutive_transient += 1
@@ -210,34 +209,34 @@ def dispatch_sandbox(
                     action="submitted",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
-                    detail=f"{detail_s} | reply: skipped",
+                    report_id=report_id_txt,
+                    detail=f"topic={topic_r} {detail_s} | reply: skipped",
                     reply_json=submit_json,
                     outcome="ok",
                 )
                 summary["items"].append(
-                    {"objectId": objid, "candid": candid, "ok": True, "report_id": report_id_any, "detail": "reply skipped"}
+                    {"objectId": objid, "candid": candid, "topic": topic_r, "ok": True, "report_id": report_id_txt, "detail": "reply skipped"}
                 )
                 consecutive_transient = 0
                 continue
 
             try:
-                ok_r, detail_r, reply_json = client.reply(report_id=str(report_id_any), wait_s=int(wait_s), poll_s=int(poll_s))
+                ok_r, detail_r, reply_json = client.reply(report_id=str(report_id_txt), wait_s=int(wait_s), poll_s=int(poll_s))
             except Exception as e:
                 summary["reply_failed"] += 1
                 summary["submitted"] += 1
-                msg = f"{detail_s} | reply_exception: {e}"
+                msg = f"topic={topic_r} {detail_s} | reply_exception: {e}"
                 db.tns_log(
                     action="submitted",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
+                    report_id=report_id_txt,
                     detail=msg,
                     reply_json=submit_json,
                     outcome="warn",
                 )
                 summary["items"].append(
-                    {"objectId": objid, "candid": candid, "ok": True, "report_id": report_id_any, "detail": msg}
+                    {"objectId": objid, "candid": candid, "topic": topic_r, "ok": True, "report_id": report_id_txt, "detail": msg}
                 )
                 consecutive_transient = 0
                 continue
@@ -246,17 +245,17 @@ def dispatch_sandbox(
                 summary["reply_failed"] += 1
                 summary["submitted"] += 1
                 summary["aborted_auth"] = True
-                msg = f"{detail_s} | reply_auth_fatal: {detail_r}"
+                msg = f"topic={topic_r} {detail_s} | reply_auth_fatal: {detail_r}"
                 db.tns_log(
                     action="submitted",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
+                    report_id=report_id_txt,
                     detail=msg,
                     reply_json=reply_json,
                     outcome="warn",
                 )
-                summary["items"].append({"objectId": objid, "candid": candid, "ok": True, "report_id": report_id_any, "detail": msg})
+                summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": True, "report_id": report_id_txt, "detail": msg})
                 summary["detail"] = "auth fatal during reply"
                 break
 
@@ -266,8 +265,8 @@ def dispatch_sandbox(
                     action="submitted",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
-                    detail=f"{detail_s} | reply: {detail_r}",
+                    report_id=report_id_txt,
+                    detail=f"topic={topic_r} {detail_s} | reply: {detail_r}",
                     reply_json=reply_json,
                     outcome="ok",
                 )
@@ -277,14 +276,14 @@ def dispatch_sandbox(
                     action="submitted",
                     object_id=objid,
                     candid=candid,
-                    report_id=report_id,
-                    detail=f"{detail_s} | reply: {detail_r}",
+                    report_id=report_id_txt,
+                    detail=f"topic={topic_r} {detail_s} | reply: {detail_r}",
                     reply_json=reply_json,
                     outcome="warn",
                 )
 
             summary["items"].append(
-                {"objectId": objid, "candid": candid, "ok": True, "report_id": report_id_any, "detail": f"{detail_s} | reply={detail_r}"}
+                {"objectId": objid, "candid": candid, "topic": topic_r, "ok": True, "report_id": report_id_txt, "detail": f"{detail_s} | reply={detail_r}"}
             )
             consecutive_transient = 0
 

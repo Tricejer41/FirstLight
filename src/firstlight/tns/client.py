@@ -200,61 +200,55 @@ class TNSClient:
         """
         Robust auth preflight.
 
-        Why:
-          - /test is NOT reliable in some deployments (can 401/403 even when submit/reply work).
-          - What matters is: can we authenticate against the endpoints we actually use?
-
         Strategy:
-          - Probe bulk-report-reply with a dummy report_id ("0") using POST form (the method that works for reply).
-          - Optionally probe the alternate reply URL if the primary looks unsupported (404/405).
-          - Mark AUTH_FATAL only on 401/403.
-          - Any other HTTP response means "auth accepted but report not found / method unsupported" => ok=True.
+          - Probe reply endpoint with a dummy report_id ("0") using POST form.
+          - If primary looks unsupported OR fatal, also probe alt once.
+          - Mark AUTH_FATAL only if ALL HTTP attempts are 401/403.
+          - Any other HTTP response means "auth accepted (or at least not fatal)".
 
         Returns:
           ok=True  => safe to run dispatch (auth is not fatal)
-          ok=False => fatal auth (401/403) OR client-side error (no HTTP)
+          ok=False => fatal auth (401/403 everywhere) OR client-side error (no HTTP)
         """
         attempts: List[TNSResponse] = []
         dummy_rid = "0"
 
         def probe(url: str, tag: str) -> TNSResponse:
-            # minimal, deterministic probe (no schema side effects)
             return self._post_form(url, {"api_key": self.api_key, "report_id": dummy_rid}, tag)
 
-        # primary probe (1 request)
+        # primary
         try:
             attempts.append(probe(self.reply_url, "preflight:reply:form(primary)"))
         except Exception as exc:
             attempts.append(self._exc_response("preflight:reply:form(primary,exception)", exc))
 
-        # if primary looks "unsupported", try alt (at most 1 extra request)
-        if attempts and attempts[0].http in (404, 405):
-            try:
-                attempts.append(probe(self.reply_url_alt, "preflight:reply:form(alt)"))
-            except Exception as exc:
-                attempts.append(self._exc_response("preflight:reply:form(alt,exception)", exc))
+        # alt (only if primary is unsupported OR fatal)
+        if attempts:
+            h0 = attempts[0].http
+            if h0 in (401, 403, 404, 405):
+                try:
+                    attempts.append(probe(self.reply_url_alt, "preflight:reply:form(alt)"))
+                except Exception as exc:
+                    attempts.append(self._exc_response("preflight:reply:form(alt,exception)", exc))
 
-        # classify
-        any_fatal = any(a.http in (401, 403) for a in attempts)
         any_http = any(a.http != 0 for a in attempts)
-        any_ok200 = any(a.http == 200 and str(a.id_code) == "200" for a in attempts)
+        http_attempts = [a for a in attempts if a.http != 0]
+        all_fatal = bool(http_attempts) and all(a.http in (401, 403) for a in http_attempts)
+
+        any_ok200 = any(a.http == 200 and str(a.id_code) == "200" for a in http_attempts)
 
         summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
         raw = next((a.raw_json for a in attempts if isinstance(a.raw_json, dict)), None)
 
-        if any_fatal:
-            # Use a single flag that downstream can detect safely.
+        if all_fatal:
             detail = (
                 f"preflight=fatal_auth fatal=auth ({summary}) "
                 f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
             )
             return False, detail, (raw or {})
 
-        # If we got ANY HTTP response that is not 401/403, auth is not fatal.
-        # 404 is expected for dummy report_id; 400 can happen too depending on API validation.
         if any_http:
-            best = next((a for a in attempts if a.http != 0), attempts[0])
-            # NOTE: even if best.http is 404, that's a GOOD sign for auth.
+            best = next((a for a in http_attempts if a.http == 200), http_attempts[0])
             status = "ok" if (any_ok200 or best.http in (200, 400, 404, 405, 422)) else "ok"
             detail = (
                 f"preflight={status} via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
@@ -263,7 +257,6 @@ class TNSClient:
             )
             return True, detail, (best.raw_json or {})
 
-        # no HTTP at all => local/network error (transient)
         detail = (
             f"preflight=error (no http response) ({summary}) "
             f"[{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
@@ -606,20 +599,18 @@ class TNSClient:
                 break
 
         if best is None:
-            # no ok found: pick first attempt if exists, else synthetic error
             best = attempts[0] if attempts else self._exc_response("submit:none", RuntimeError("no submit attempts"))
 
-        # Only summarize what we actually ran (no hidden 401 from unneeded fallbacks)
         summary = " | ".join(
             [f"{a.method}:{a.http}:{a.id_code}:{a.id_message}:rid={a.report_id}" for a in attempts]
         )
 
-        all401 = (len(attempts) > 0) and all(a.http == 401 for a in attempts)
+        http_attempts = [a for a in attempts if a.http != 0]
+        all401 = bool(http_attempts) and all(a.http == 401 for a in http_attempts)
         flags: List[str] = []
         if all401:
             flags.append("fatal=auth")
 
-        # If ok, label explicitly ok to help downstream classification
         status = "ok" if best.ok else "failed"
 
         detail = (
@@ -634,6 +625,60 @@ class TNSClient:
 
     def submit_min(self) -> Tuple[bool, str, Optional[Any], Optional[Dict[str, Any]]]:
         return self.submit_raw(self.build_submit_min_payload())
+
+    def reply_fast(self, report_id: Any) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Fast one-shot reply check for morning sweeps:
+        - POST form to primary
+        - if primary unsupported (404/405) OR fatal (401/403), probe alt once
+        - fatal only if all HTTP attempts are 401/403
+        """
+        rid = str(report_id).strip()
+        if not rid:
+            return False, "report_id is empty", {"id_code": "client_error", "id_message": "empty report_id"}
+
+        attempts: List[TNSResponse] = []
+        try:
+            attempts.append(self._post_form(self.reply_url, {"api_key": self.api_key, "report_id": rid}, "reply_fast:form(primary)"))
+        except Exception as exc:
+            attempts.append(self._exc_response("reply_fast:form(primary,exception)", exc))
+
+        if attempts:
+            h0 = attempts[0].http
+            if h0 in (401, 403, 404, 405):
+                try:
+                    attempts.append(self._post_form(self.reply_url_alt, {"api_key": self.api_key, "report_id": rid}, "reply_fast:form(alt)"))
+                except Exception as exc:
+                    attempts.append(self._exc_response("reply_fast:form(alt,exception)", exc))
+
+        http_attempts = [a for a in attempts if a.http != 0]
+        if not http_attempts:
+            a0 = attempts[0]
+            return False, f"preflight=error (no http) ({a0.method}:{a0.id_message})", {"id_code": "exception", "id_message": a0.id_message}
+
+        all_fatal = all(a.http in (401, 403) for a in http_attempts)
+        if all_fatal:
+            best = http_attempts[0]
+            summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
+            detail = (
+                f"fatal=auth via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
+                f"id_code={best.id_code} id_message={best.id_message} "
+                f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
+            )
+            return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
+
+        best = next((a for a in http_attempts if a.http == 200 and isinstance(a.raw_json, dict)), http_attempts[0])
+
+        if best.http == 404:
+            return False, "not_ready http=404", (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
+
+        if best.http != 200:
+            detail = f"http={best.http} via={best.method} id_code={best.id_code} id_message={best.id_message}"
+            return False, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
+
+        ok = (str(best.id_code) == "200")
+        detail = f"ok={ok} via={best.method} http=200 id_code={best.id_code} id_message={best.id_message}"
+        return ok, detail, (best.raw_json or {"id_code": best.id_code, "id_message": best.id_message})
 
     def reply(self, report_id: Any, wait_s: int = 600, poll_s: int = 10) -> Tuple[bool, str, Dict[str, Any]]:
         rid = str(report_id).strip()

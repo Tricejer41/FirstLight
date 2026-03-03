@@ -278,31 +278,31 @@ Rotate-LogIfNeeded $dispatchOut $RotateMaxMB $RotateKeep
 Rotate-LogIfNeeded $dispatchErr $RotateMaxMB $RotateKeep
 Rotate-LogIfNeeded $replayJsonl $RotateMaxMB $RotateKeep
 
-"RUN=$run"                       | Out-File -FilePath $meta -Encoding utf8
-"RAW=$rawDir"                    | Add-Content -Path $meta -Encoding utf8
-"LOG=$logDir"                    | Add-Content -Path $meta -Encoding utf8
-"DB=$dbAbs"                      | Add-Content -Path $meta -Encoding utf8
-"CFG=$cfgAbs"                    | Add-Content -Path $meta -Encoding utf8
-"ENV=$envPath"                   | Add-Content -Path $meta -Encoding utf8
+"RUN=$run"                         | Out-File -FilePath $meta -Encoding utf8
+"RAW=$rawDir"                      | Add-Content -Path $meta -Encoding utf8
+"LOG=$logDir"                      | Add-Content -Path $meta -Encoding utf8
+"DB=$dbAbs"                        | Add-Content -Path $meta -Encoding utf8
+"CFG=$cfgAbs"                      | Add-Content -Path $meta -Encoding utf8
+"ENV=$envPath"                     | Add-Content -Path $meta -Encoding utf8
 "UseStableLogDir=$UseStableLogDir" | Add-Content -Path $meta -Encoding utf8
-"RotateMaxMB=$RotateMaxMB"       | Add-Content -Path $meta -Encoding utf8
-"RotateKeep=$RotateKeep"         | Add-Content -Path $meta -Encoding utf8
-"MaxHours=$MaxHours"             | Add-Content -Path $meta -Encoding utf8
-"DispatchEveryS=$DispatchEveryS" | Add-Content -Path $meta -Encoding utf8
+"RotateMaxMB=$RotateMaxMB"         | Add-Content -Path $meta -Encoding utf8
+"RotateKeep=$RotateKeep"           | Add-Content -Path $meta -Encoding utf8
+"MaxHours=$MaxHours"               | Add-Content -Path $meta -Encoding utf8
+"DispatchEveryS=$DispatchEveryS"   | Add-Content -Path $meta -Encoding utf8
 "DispatchIdleEveryS=$DispatchIdleEveryS" | Add-Content -Path $meta -Encoding utf8
-"DispatchPollS=$DispatchPollS"   | Add-Content -Path $meta -Encoding utf8
+"DispatchPollS=$DispatchPollS"     | Add-Content -Path $meta -Encoding utf8
 "DispatchFailBackoffStartS=$DispatchFailBackoffStartS" | Add-Content -Path $meta -Encoding utf8
-"DispatchFailBackoffMaxS=$DispatchFailBackoffMaxS" | Add-Content -Path $meta -Encoding utf8
-"WatchdogS=$WatchdogS"           | Add-Content -Path $meta -Encoding utf8
+"DispatchFailBackoffMaxS=$DispatchFailBackoffMaxS"     | Add-Content -Path $meta -Encoding utf8
+"WatchdogS=$WatchdogS"             | Add-Content -Path $meta -Encoding utf8
 "PreflightMaxWaitS=$PreflightMaxWaitS" | Add-Content -Path $meta -Encoding utf8
 "DispatchSinceHours=$DispatchSinceHours" | Add-Content -Path $meta -Encoding utf8
-"DispatchMaxSubmit=$DispatchMaxSubmit" | Add-Content -Path $meta -Encoding utf8
-"DispatchWaitS=$DispatchWaitS"   | Add-Content -Path $meta -Encoding utf8
-"DispatchTimeoutS=$DispatchTimeoutS" | Add-Content -Path $meta -Encoding utf8
-"DispatchSkipReply=$DispatchSkipReply" | Add-Content -Path $meta -Encoding utf8
-"DispatchTopic=$DispatchTopic"   | Add-Content -Path $meta -Encoding utf8
-"PythonExe=$PythonExe"           | Add-Content -Path $meta -Encoding utf8
-"FinkConsumerExe=$FinkConsumerExe" | Add-Content -Path $meta -Encoding utf8
+"DispatchMaxSubmit=$DispatchMaxSubmit"   | Add-Content -Path $meta -Encoding utf8
+"DispatchWaitS=$DispatchWaitS"           | Add-Content -Path $meta -Encoding utf8
+"DispatchTimeoutS=$DispatchTimeoutS"     | Add-Content -Path $meta -Encoding utf8
+"DispatchSkipReply=$DispatchSkipReply"   | Add-Content -Path $meta -Encoding utf8
+"DispatchTopic=$DispatchTopic"           | Add-Content -Path $meta -Encoding utf8
+"PythonExe=$PythonExe"                   | Add-Content -Path $meta -Encoding utf8
+"FinkConsumerExe=$FinkConsumerExe"       | Add-Content -Path $meta -Encoding utf8
 
 Append-Log $dispatchOut "run started"
 Append-Log $dispatchErr "run started"
@@ -392,13 +392,15 @@ function Run-DispatchOnce(
     try { $p.Refresh() } catch {}
   }
 
-  # PowerShell 5.1 safe exit code capture (no ternary)
-  $exitCode = "unknown"
+  # Robust exit code capture (avoid blank "exit=")
+  $exitCode = $null
   try {
-    if ($p -and $p.HasExited) { $exitCode = $p.ExitCode }
+    if ($p) { $p.Refresh() }
+    if ($p -and $p.HasExited) { $exitCode = [string]$p.ExitCode }
   } catch {
-    $exitCode = "unknown"
+    $exitCode = $null
   }
+  if ([string]::IsNullOrWhiteSpace($exitCode)) { $exitCode = "unknown" }
 
   Append-Log $outSummary ("dispatch end exit={0}" -f $exitCode)
 
@@ -492,11 +494,11 @@ try {
       $now = Get-Date
 
       if ($res -ne $null) {
-        if ($res.ExitCode -eq 10) {
+        if ($res.ExitCode -eq "10") {
           $dispatchDisabled = $true
           Append-Log $dispatchErr "dispatch disabled for the rest of the night (AUTH_FATAL). Fix .env / API key."
         }
-        elseif ($res.TimedOut -or ($res.ExitCode -ne 0 -and $res.ExitCode -ne $null -and $res.ExitCode -ne "unknown")) {
+        elseif ($res.TimedOut -or ($res.ExitCode -ne "0" -and $res.ExitCode -ne $null -and $res.ExitCode -ne "unknown")) {
           $dispatchBackoffS = [Math]::Min($DispatchFailBackoffMaxS, [Math]::Max($DispatchFailBackoffStartS, $dispatchBackoffS * 2))
           Append-Log $dispatchErr ("dispatch failure -> backoff {0}s (exit={1})" -f $dispatchBackoffS, $res.ExitCode)
           $nextDispatch = $now.AddSeconds([Math]::Max(10,$dispatchBackoffS))
