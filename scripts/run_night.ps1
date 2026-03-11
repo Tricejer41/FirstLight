@@ -61,13 +61,13 @@ param(
 
   # --- log compaction / rotation ---
   [Parameter(Mandatory=$false)]
-  [bool]$UseStableLogDir = $true,          # if true => alertDB\logs\_last (no timestamp dirs)
+  [bool]$UseStableLogDir = $true,
 
   [Parameter(Mandatory=$false)]
-  [int]$RotateMaxMB = 25,                  # rotate when file grows beyond this
+  [int]$RotateMaxMB = 25,
 
   [Parameter(Mandatory=$false)]
-  [int]$RotateKeep = 2                     # keep .1 .. .N
+  [int]$RotateKeep = 2
 )
 
 Set-StrictMode -Version Latest
@@ -213,7 +213,12 @@ if ([string]::IsNullOrWhiteSpace($PythonExe)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($FinkConsumerExe)) {
-  $FinkConsumerExe = (Get-Command fink_consumer -ErrorAction Stop).Source
+  $venvFink = Join-Path $RepoRoot ".venv\Scripts\fink_consumer.exe"
+  if (Test-Path $venvFink) {
+    $FinkConsumerExe = (Resolve-Path $venvFink).Path
+  } else {
+    $FinkConsumerExe = (Get-Command fink_consumer -ErrorAction Stop).Source
+  }
 } else {
   $FinkConsumerExe = Resolve-PathFlex $RepoRoot $FinkConsumerExe
 }
@@ -278,6 +283,12 @@ Rotate-LogIfNeeded $dispatchOut $RotateMaxMB $RotateKeep
 Rotate-LogIfNeeded $dispatchErr $RotateMaxMB $RotateKeep
 Rotate-LogIfNeeded $replayJsonl $RotateMaxMB $RotateKeep
 
+# Stable dir reuses the same files. Reset the dispatch summaries for a clean run.
+"" | Out-File -FilePath $dispatchOut -Encoding utf8
+"" | Out-File -FilePath $dispatchErr -Encoding utf8
+"" | Out-File -FilePath $dispatchLastOut -Encoding utf8
+"" | Out-File -FilePath $dispatchLastErr -Encoding utf8
+
 "RUN=$run"                         | Out-File -FilePath $meta -Encoding utf8
 "RAW=$rawDir"                      | Add-Content -Path $meta -Encoding utf8
 "LOG=$logDir"                      | Add-Content -Path $meta -Encoding utf8
@@ -306,9 +317,6 @@ Rotate-LogIfNeeded $replayJsonl $RotateMaxMB $RotateKeep
 
 Append-Log $dispatchOut "run started"
 Append-Log $dispatchErr "run started"
-
-"" | Out-File -FilePath $dispatchLastOut -Encoding utf8
-"" | Out-File -FilePath $dispatchLastErr -Encoding utf8
 
 # -------------------------
 # Preflight Kafka
@@ -355,9 +363,6 @@ function Run-DispatchOnce(
   [bool]$skipReply,
   [string]$topic
 ) {
-  $outOne = $lastOut
-  $errOne = $lastErr
-
   Rotate-LogIfNeeded $outSummary $RotateMaxMB $RotateKeep
   Rotate-LogIfNeeded $errSummary $RotateMaxMB $RotateKeep
 
@@ -377,38 +382,71 @@ function Run-DispatchOnce(
 
   Append-Log $outSummary ("dispatch start (since_hours={0} max_submit={1} skip_reply={2} topic={3})" -f $sinceHours, $maxSubmit, $skipReply, $topic)
 
-  $p = Start-Process -FilePath $py -ArgumentList $args -NoNewWindow -PassThru `
-        -RedirectStandardOutput $outOne -RedirectStandardError $errOne
+  $timedOut = $false
+  $t0 = Get-Date
+  $global:LASTEXITCODE = 0
 
-  $exited = $false
-  try { $exited = $p.WaitForExit([Math]::Max(5, $timeoutS) * 1000) } catch { $exited = $false }
-
-  if (-not $exited) {
-    Append-Log $errSummary ("dispatch TIMEOUT -> killing pid={0} after {1}s" -f $p.Id, $timeoutS)
-    Stop-Proc $p
-    try { $p.Refresh() } catch {}
-  } else {
-    try { $p.WaitForExit() } catch {}
-    try { $p.Refresh() } catch {}
-  }
-
-  # Robust exit code capture (avoid blank "exit=")
-  $exitCode = $null
   try {
-    if ($p) { $p.Refresh() }
-    if ($p -and $p.HasExited) { $exitCode = [string]$p.ExitCode }
+    & $py @args 1> $lastOut 2> $lastErr
   } catch {
-    $exitCode = $null
+    $msg = $_.Exception.Message
+    Set-Content -LiteralPath $lastErr -Value ("run_night.ps1: failed to start dispatch python: {0}" -f $msg)
+    $global:LASTEXITCODE = 900
   }
-  if ([string]::IsNullOrWhiteSpace($exitCode)) { $exitCode = "unknown" }
 
-  Append-Log $outSummary ("dispatch end exit={0}" -f $exitCode)
+  $dt = (Get-Date) - $t0
+  $ms = [int]$dt.TotalMilliseconds
+  $exitCode = $global:LASTEXITCODE
+  if ($null -eq $exitCode) { $exitCode = 901 }
+  $exitCode = [string]$exitCode
+
+  $doneLine = ""
+  $tailText = ""
+  if (Test-Path -LiteralPath $lastOut) {
+    $tailLines = Get-Content -LiteralPath $lastOut -ErrorAction SilentlyContinue | Select-Object -Last 120
+    if ($tailLines) {
+      $tailText = ($tailLines | Out-String)
+      $done = $tailLines | Select-String -Pattern '^done:' -ErrorAction SilentlyContinue | Select-Object -Last 1
+      if ($done -and $done.Line) { $doneLine = $done.Line.Trim() }
+    }
+  }
+
+  Append-Log $outSummary ("dispatch end exit={0} elapsed_ms={1} {2}" -f $exitCode, $ms, $doneLine)
+
+  $errBytes = 0
+  if (Test-Path -LiteralPath $lastErr) { $errBytes = (Get-Item -LiteralPath $lastErr).Length }
+  if (($exitCode -ne "0") -or ($errBytes -gt 0)) {
+    Append-Log $errSummary ("dispatch issue exit={0} stderr_bytes={1}" -f $exitCode, $errBytes)
+    if ($errBytes -gt 0) {
+      $tail = Get-Content -LiteralPath $lastErr -ErrorAction SilentlyContinue | Select-Object -Last 80
+      foreach ($line in $tail) {
+        Add-Content -LiteralPath $errSummary -Value ("    {0}" -f $line)
+      }
+    }
+  }
+
+  $idle = $false
+  if ($tailText -match 'done:\s+candidates=0') { $idle = $true }
+
+  $capReached = $false
+  $capDetail = ""
+  if ($tailText -match '(?im)^\s*CAP_REACHED\s*$') {
+    $capReached = $true
+    $capDetail = 'CAP_REACHED'
+  }
+  if ($tailText -match 'detail=(cap reached:[^\r\n]+)') {
+    $capReached = $true
+    $capDetail = $Matches[1]
+  }
 
   return [PSCustomObject]@{
-    ExitCode = $exitCode
-    TimedOut = (-not $exited)
-    OutFile  = $outOne
-    ErrFile  = $errOne
+    ExitCode   = $exitCode
+    TimedOut   = $timedOut
+    OutFile    = $lastOut
+    ErrFile    = $lastErr
+    Idle       = $idle
+    CapReached = $capReached
+    CapDetail  = $capDetail
   }
 }
 
@@ -430,7 +468,6 @@ $until = (Get-Date).AddHours($MaxHours)
 Write-Host ("Running until {0}" -f $until)
 
 $nextDispatch = Get-Date
-$dispatchDisabled = $false
 $dispatchBackoffS = [Math]::Max(10, $DispatchFailBackoffStartS)
 
 $stopMsg = $null
@@ -468,8 +505,7 @@ try {
       $backoffReplay = 5
     }
 
-    if (-not $dispatchDisabled -and (Get-Date) -ge $nextDispatch) {
-
+    if ((Get-Date) -ge $nextDispatch) {
       $res = $null
       try {
         $res = Run-DispatchOnce `
@@ -495,24 +531,28 @@ try {
 
       if ($res -ne $null) {
         if ($res.ExitCode -eq "10") {
-          $dispatchDisabled = $true
-          Append-Log $dispatchErr "dispatch disabled for the rest of the night (AUTH_FATAL). Fix .env / API key."
+          $stopMsg = ("AUTH_FATAL at {0}: stop night immediately" -f $now.ToString("yyyy-MM-dd HH:mm:ss"))
+          Append-Log $dispatchErr $stopMsg
+          break
         }
-        elseif ($res.TimedOut -or ($res.ExitCode -ne "0" -and $res.ExitCode -ne $null -and $res.ExitCode -ne "unknown")) {
+
+        if ($res.CapReached) {
+          if ([string]::IsNullOrWhiteSpace($res.CapDetail)) {
+            $stopMsg = ("MAX SUBMIT reached ({0}) at {1}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"))
+          } else {
+            $stopMsg = ("MAX SUBMIT reached ({0}) at {1} :: {2}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"), $res.CapDetail)
+          }
+          Append-Log $dispatchOut $stopMsg
+          break
+        }
+
+        if ($res.TimedOut -or ($res.ExitCode -ne "0" -and $res.ExitCode -ne $null)) {
           $dispatchBackoffS = [Math]::Min($DispatchFailBackoffMaxS, [Math]::Max($DispatchFailBackoffStartS, $dispatchBackoffS * 2))
           Append-Log $dispatchErr ("dispatch failure -> backoff {0}s (exit={1})" -f $dispatchBackoffS, $res.ExitCode)
           $nextDispatch = $now.AddSeconds([Math]::Max(10,$dispatchBackoffS))
-        }
-        else {
+        } else {
           $dispatchBackoffS = [Math]::Max(10, $DispatchFailBackoffStartS)
-
-          $idle = $false
-          try {
-            $tail = (Get-Content -LiteralPath $res.OutFile -Tail 80 -ErrorAction Stop | Out-String)
-            if ($tail -match "done:\s+candidates=0") { $idle = $true }
-          } catch {}
-
-          if ($idle) {
+          if ($res.Idle) {
             $nextDispatch = $now.AddSeconds([Math]::Max(10,$DispatchIdleEveryS))
           } else {
             $nextDispatch = $now.AddSeconds([Math]::Max(10,$DispatchEveryS))
@@ -531,7 +571,6 @@ try {
   }
 
 } finally {
-
   $stopMsg | Out-File $stopReason -Encoding utf8
 
   Write-Host "Stopping processes..."

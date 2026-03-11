@@ -6,8 +6,9 @@ Usage:
   python -m firstlight tns envcheck
   python -m firstlight --env .env tns test-auth
   python -m firstlight --env .env tns submit-min
+  python -m firstlight --env .env tns submit-min --print-payload
   python -m firstlight --env .env tns reply <REPORT_ID> [--raw]
-  python -m firstlight --env .env tns dispatch-sandbox --db firstlight.sqlite --since-hours 24 --max-submit 3 [--dry-run]
+  python -m firstlight --env .env tns dispatch-sandbox --db firstlight.sqlite --since-hours 24 --max-submit 3 [--dry-run] [--print-payload]
   python -m firstlight --env .env tns sweep-replies --db firstlight.sqlite --since-hours 24 --max 50
 
 Exit codes (dispatch-sandbox):
@@ -15,6 +16,7 @@ Exit codes (dispatch-sandbox):
   10 -> AUTH_FATAL (stop dispatching; fix env/api key)
   11 -> RETRYABLE/FAIL (submit failures; retry later)
   12 -> INTERNAL_ERROR
+  21 -> CAP_REACHED (night can stop early if desired)
 """
 
 from __future__ import annotations
@@ -50,6 +52,14 @@ def _load_env(path: Optional[str]) -> None:
     load_dotenv(dotenv_path=path, override=True)
 
 
+def _send_enabled() -> bool:
+    """Kill-switch: allow real TNS submissions only when explicitly enabled."""
+    import os
+
+    v = (os.getenv("FIRSTLIGHT_TNS_SEND", "") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _cmd_tns_envcheck(args: argparse.Namespace) -> int:
     _load_env(args.env)
     c = TNSClient.from_env()
@@ -69,6 +79,14 @@ def _cmd_tns_test_auth(args: argparse.Namespace) -> int:
 def _cmd_tns_submit_min(args: argparse.Namespace) -> int:
     _load_env(args.env)
     c = TNSClient.from_env()
+
+    if args.print_payload:
+        print(_safe_json(c.build_submit_min_payload()))
+        return 0
+
+    if not _send_enabled():
+        print("SEND_DISABLED: set FIRSTLIGHT_TNS_SEND=1 to allow real submissions.")
+        return 3
 
     print(f"submit_url: {c.submit_url}")
     ok, detail, report_id, _raw = c.submit_min()
@@ -167,7 +185,8 @@ def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
 
     print(
         f"dispatch: db={args.db} since_hours={args.since_hours} max_submit={args.max_submit} "
-        f"topic={args.topic!r} dry_run={args.dry_run} skip_reply={args.skip_reply} wait_s={args.wait_s} poll_s={args.poll_s}"
+        f"max_attempts={args.max_attempts} topic={args.topic!r} dry_run={args.dry_run} print_payload={args.print_payload} "
+        f"skip_reply={args.skip_reply} wait_s={args.wait_s} poll_s={args.poll_s}"
     )
 
     try:
@@ -175,7 +194,9 @@ def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
             db_path=args.db,
             since_hours=args.since_hours,
             max_submit=args.max_submit,
+            max_attempts=args.max_attempts,
             dry_run=bool(args.dry_run),
+            print_payload=bool(args.print_payload),
             topic=args.topic,
             skip_reply=bool(args.skip_reply),
             wait_s=int(args.wait_s),
@@ -193,16 +214,32 @@ def _cmd_tns_dispatch_sandbox(args: argparse.Namespace) -> int:
         ok = it.get("ok")
         detail = it.get("detail")
         rid = it.get("report_id")
+        payload = it.get("payload")
         if rid is not None:
             print(f"- {objid} candid={candid} topic={topic}: ok={ok} report_id={rid} detail={detail}")
         else:
             print(f"- {objid} candid={candid} topic={topic}: ok={ok} detail={detail}")
+        if payload is not None:
+            print("  payload:")
+            print(_safe_json(payload))
 
     print(
         f"done: candidates={res.get('candidates')} submitted={res.get('submitted')} "
         f"failed_submit={res.get('failed_submit')} reply_failed={res.get('reply_failed')} "
-        f"aborted_auth={res.get('aborted_auth')} aborted_transient={res.get('aborted_transient')} detail={res.get('detail')}"
+        f"submitted_existing={res.get('submitted_existing')} submitted_total={res.get('submitted_total')} "
+        f"aborted_auth={res.get('aborted_auth')} aborted_transient={res.get('aborted_transient')} "
+        f"aborted_send_disabled={res.get('aborted_send_disabled')} detail={res.get('detail')}"
     )
+
+    detail_s = str(res.get("detail") or "")
+
+    if detail_s.lower().startswith("cap reached:"):
+        print("CAP_REACHED")
+        return 21
+
+    if res.get("aborted_send_disabled"):
+        print("SEND_DISABLED")
+        return 0
 
     if res.get("aborted_auth"):
         print("AUTH_FATAL")
@@ -235,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_test.set_defaults(func=_cmd_tns_test_auth)
 
     p_submit = tns_sub.add_parser("submit-min", help="Submit a minimal test payload (for schema convergence)")
+    p_submit.add_argument("--print-payload", action="store_true", help="Print the exact payload (no network)")
     p_submit.set_defaults(func=_cmd_tns_submit_min)
 
     p_reply = tns_sub.add_parser("reply", help="Fetch reply/validation feedback for a report_id")
@@ -257,8 +295,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_dispatch.add_argument("--db", required=True, help="Path to sqlite DB (e.g. firstlight.sqlite)")
     p_dispatch.add_argument("--since-hours", type=float, default=24.0, help="Only consider passed decisions in last N hours")
     p_dispatch.add_argument("--max-submit", type=int, default=3, help="Max number of candidates to submit")
+    p_dispatch.add_argument("--max-attempts", type=int, default=None, help="Guardrail: max candidates to attempt (default=max_submit*5)")
     p_dispatch.add_argument("--topic", default=None, help="Optional topic filter (e.g. n1). If omitted, any topic.")
     p_dispatch.add_argument("--dry-run", action="store_true", help="Do not submit; just print what would be done")
+    p_dispatch.add_argument("--print-payload", action="store_true", help="In dry-run, also build+print the exact payload that would be submitted")
     p_dispatch.add_argument("--skip-reply", action="store_true", help="Submit only; do not poll reply (most stable)")
     p_dispatch.add_argument("--wait-s", type=int, default=60, help="Max time to wait for reply after submit (seconds)")
     p_dispatch.add_argument("--poll-s", type=int, default=5, help="Polling interval while waiting (seconds)")

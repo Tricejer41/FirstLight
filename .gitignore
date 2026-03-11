@@ -16,3 +16,17 @@ secrets/
 _salvage_client.py
 scripts/db_check.py
 scripts/db_max.py
+# Local runtime databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Local env files
+.env
+.env.*
+!config/*.example.env
+
+# Runtime data / logs
+alertDB/raw/
+alertDB/logs/

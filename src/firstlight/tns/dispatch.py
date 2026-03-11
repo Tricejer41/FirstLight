@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Any, Dict, Optional
 
 from ..storage.db import DB
@@ -10,6 +11,12 @@ from .client import TNSClient
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _send_enabled() -> bool:
+    """Kill-switch: real TNS submit is only allowed when explicitly enabled."""
+    v = (os.getenv("FIRSTLIGHT_TNS_SEND", "") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def _is_auth_fatal(detail: str) -> bool:
@@ -51,7 +58,9 @@ def dispatch_sandbox(
     db_path: str,
     since_hours: float,
     max_submit: int,
+    max_attempts: Optional[int] = None,
     dry_run: bool,
+    print_payload: bool = False,
     topic: Optional[str] = None,
     skip_reply: bool = False,
     wait_s: int = 60,
@@ -70,15 +79,34 @@ def dispatch_sandbox(
     summary: Dict[str, Any] = {
         "candidates": 0,
         "submitted": 0,
+        "submitted_existing": 0,
+        "submitted_total": 0,
         "failed_submit": 0,
         "reply_failed": 0,
         "aborted_auth": False,
         "aborted_transient": False,
+        "aborted_send_disabled": False,
         "detail": "",
         "items": [],
     }
 
     try:
+        # Kill-switch: do not allow real sending unless explicitly enabled.
+        if not dry_run and not _send_enabled():
+            summary["aborted_send_disabled"] = True
+            summary["detail"] = "send disabled (set FIRSTLIGHT_TNS_SEND=1 to allow real submits)"
+            # Persist a trace for audit.
+            db.tns_log(
+                action="send_disabled",
+                object_id="_SYSTEM",
+                candid="_SYSTEM",
+                report_id=None,
+                detail=summary["detail"],
+                reply_json=None,
+                outcome="skip",
+            )
+            return summary
+
         # Robust preflight: probes reply endpoint (dummy report_id) and only treats 401/403 as fatal.
         ok_auth, detail_auth, _raw_auth = client.test_auth()
         if not ok_auth and _is_auth_fatal(detail_auth):
@@ -87,7 +115,39 @@ def dispatch_sandbox(
             return summary
 
         since_dt = _utcnow() - timedelta(hours=float(since_hours))
-        candidates = list(db.iter_dispatch_candidates(since_dt=since_dt, max_rows=int(max_submit), topic=topic))
+
+        # Hard cap: max_submit counts ONLY successful submits (action='submitted').
+        existing_ok = int(db.count_tns_actions("submitted", since_dt=since_dt))
+        summary["submitted_existing"] = existing_ok
+        submitted_total = existing_ok
+        summary["submitted_total"] = submitted_total
+
+        if submitted_total >= int(max_submit):
+            summary["detail"] = f"cap reached: already submitted {submitted_total}/{int(max_submit)} in last {since_hours}h"
+            db.tns_log(
+                action="cap_reached",
+                object_id="_SYSTEM",
+                candid="_SYSTEM",
+                report_id=None,
+                detail=summary["detail"],
+                reply_json=None,
+                outcome="skip",
+            )
+            return summary
+
+        # Attempt budget (guardrail against spammy failures).
+        if max_attempts is None:
+            env_attempts = (os.getenv("FIRSTLIGHT_DISPATCH_MAX_ATTEMPTS", "") or "").strip()
+            if env_attempts:
+                try:
+                    max_attempts = int(env_attempts)
+                except Exception:
+                    max_attempts = None
+        if max_attempts is None:
+            max_attempts = max(int(max_submit) * 5, int(max_submit))
+        max_attempts = max(1, int(max_attempts))
+
+        candidates = list(db.iter_dispatch_candidates(since_dt=since_dt, max_rows=int(max_attempts), topic=topic))
         summary["candidates"] = len(candidates)
 
         if summary["candidates"] == 0:
@@ -97,12 +157,33 @@ def dispatch_sandbox(
         consecutive_transient = 0
         max_consecutive_transient = 2
 
+        attempts_done = 0
+
         for cand in candidates:
+            # Stop once we reach the cap of successful submits.
+            if submitted_total >= int(max_submit):
+                summary["detail"] = f"cap reached during run: submitted_total={submitted_total}/{int(max_submit)}"
+                db.tns_log(
+                    action="cap_reached",
+                    object_id="_SYSTEM",
+                    candid="_SYSTEM",
+                    report_id=None,
+                    detail=summary["detail"],
+                    reply_json=None,
+                    outcome="skip",
+                )
+                break
+
+            attempts_done += 1
+            if attempts_done > int(max_attempts):
+                summary["detail"] = f"attempt budget reached: attempts={attempts_done-1}/{int(max_attempts)}"
+                break
+
             objid = cand.object_id
             candid = str(cand.candid) if cand.candid is not None else ""
             topic_r = cand.topic
 
-            if dry_run:
+            if dry_run and not print_payload:
                 summary["items"].append(
                     {
                         "objectId": objid,
@@ -115,7 +196,7 @@ def dispatch_sandbox(
                 )
                 continue
 
-            # Build payload
+            # Build payload (also for dry-run when print_payload=True)
             try:
                 payload = client.build_at_report_from_fink_payload(cand.alert_json)
             except Exception as e:
@@ -131,6 +212,20 @@ def dispatch_sandbox(
                     outcome="skip",
                 )
                 summary["items"].append({"objectId": objid, "candid": candid, "topic": topic_r, "ok": False, "detail": msg})
+                continue
+
+            if dry_run:
+                summary["items"].append(
+                    {
+                        "objectId": objid,
+                        "candid": candid,
+                        "topic": topic_r,
+                        "score": cand.decision_score,
+                        "action": "DRY_RUN",
+                        "reason": cand.decision_reason,
+                        "payload": payload if print_payload else None,
+                    }
+                )
                 continue
 
             # Submit
@@ -202,9 +297,13 @@ def dispatch_sandbox(
                     consecutive_transient = 0
                 continue
 
-            # Submit OK -> (opcional) reply corto
+            # Submit OK (counts toward the cap regardless of reply outcome)
+            summary["submitted"] += 1
+            submitted_total += 1
+            summary["submitted_total"] = submitted_total
+
+            # (opcional) reply corto
             if skip_reply:
-                summary["submitted"] += 1
                 db.tns_log(
                     action="submitted",
                     object_id=objid,
@@ -224,7 +323,6 @@ def dispatch_sandbox(
                 ok_r, detail_r, reply_json = client.reply(report_id=str(report_id_txt), wait_s=int(wait_s), poll_s=int(poll_s))
             except Exception as e:
                 summary["reply_failed"] += 1
-                summary["submitted"] += 1
                 msg = f"topic={topic_r} {detail_s} | reply_exception: {e}"
                 db.tns_log(
                     action="submitted",
@@ -243,7 +341,6 @@ def dispatch_sandbox(
 
             if _is_auth_fatal(str(detail_r)):
                 summary["reply_failed"] += 1
-                summary["submitted"] += 1
                 summary["aborted_auth"] = True
                 msg = f"topic={topic_r} {detail_s} | reply_auth_fatal: {detail_r}"
                 db.tns_log(
@@ -259,7 +356,6 @@ def dispatch_sandbox(
                 summary["detail"] = "auth fatal during reply"
                 break
 
-            summary["submitted"] += 1
             if ok_r:
                 db.tns_log(
                     action="submitted",

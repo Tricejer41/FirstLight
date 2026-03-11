@@ -371,6 +371,21 @@ class DB:
     # Reads (dispatch helpers)
     # -------------------------
 
+    def count_tns_actions(self, action: str, since_dt: datetime) -> int:
+        """Count rows in tns_actions for a given action since a UTC datetime."""
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        since_iso = since_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+        row = self._con.execute(
+            "SELECT COUNT(*) AS n FROM tns_actions WHERE action=? AND created_utc>=?",
+            (str(action), since_iso),
+        ).fetchone()
+        try:
+            return int(row["n"]) if row is not None else 0
+        except Exception:
+            return 0
+
     def was_submitted_or_skipped(self, object_id: str, candid: str) -> bool:
         """
         Stability fix:

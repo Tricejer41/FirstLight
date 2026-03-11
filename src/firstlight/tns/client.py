@@ -168,7 +168,14 @@ class TNSClient:
         self.nondet_filter_value = _env("TNS_NONDET_FILTER_VALUE", "")
 
         # Reporter name shown in discovery certificate text ("<reporter> report/s ...")
-        self.reporter = _env("TNS_REPORTER", "") or _env("TNS_REPORTER_NAME", "") or "Firstlight"
+        # IMPORTANT: do NOT hardcode a default here. In production we want explicit identity.
+        # Keep it empty until payload-building time; build_*() will fail loudly if missing.
+        self.reporter = _env("TNS_REPORTER_NAME", "") or _env("TNS_REPORTER", "")
+
+        # Internal name presentation in TNS search/results UI.
+        # Prefix can be empty; mode controls uniqueness/traceability.
+        self.internal_name_prefix = _env("TNS_INTERNAL_NAME_PREFIX", "")
+        self.internal_name_mode = (_env("TNS_INTERNAL_NAME_MODE", "objectid_candid") or "objectid_candid").strip().lower()
 
         # Option B: submission mode selector (auto|form|multipart|json)
         self.submit_mode = (_env("TNS_SUBMIT_MODE", "auto") or "auto").strip().lower()
@@ -267,17 +274,41 @@ class TNSClient:
     # Payload builders
     # -------------------------
 
+    def _require_reporter(self) -> str:
+        """Reporter is mandatory for any AT report payload."""
+        rep = (self.reporter or "").strip()
+        if not rep:
+            raise RuntimeError("Missing required env var: TNS_REPORTER_NAME (needed for TNS payload field 'reporter').")
+        return rep
+
+
+    def _build_internal_name(self, objid: str, cand_id: Optional[str] = None) -> str:
+        prefix = (self.internal_name_prefix or "").strip()
+        mode = (self.internal_name_mode or "objectid_candid").strip().lower()
+
+        obj = (objid or "").strip()
+        cand = (cand_id or "").strip()
+
+        if mode == "objectid":
+            base = obj
+        else:
+            base = f"{obj}_{cand}" if cand else obj
+
+        return f"{prefix}_{base}" if prefix else base
+
     def build_submit_min_payload(self) -> Dict[str, Any]:
+        rep = self._require_reporter()
         discovery_dt = _utc_now_str_ms()
         nondet_dt = _utc_str_ms_offset(-86400)
-        internal_name = f"ZTFTEST_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
+        test_prefix = (self.internal_name_prefix or "ZTFTEST").strip()
+        internal_name = f"{test_prefix}_{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}"
 
         ra_deg = "150.000000"
         dec_deg = "2.000000"
 
         at_entry: Dict[str, Any] = {
             "internal_name": internal_name,
-            "reporter": self.reporter,
+            "reporter": rep,
             "ra": {"value": ra_deg},
             "dec": {"value": dec_deg},
             "discovery_datetime": discovery_dt,
@@ -324,6 +355,7 @@ class TNSClient:
         return {"at_report": {"0": at_entry}}
 
     def build_at_report_from_fink_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        rep = self._require_reporter()
         if not isinstance(payload, dict):
             raise ValueError("payload must be dict")
         if "objectId" not in payload or "candidate" not in payload:
@@ -343,7 +375,7 @@ class TNSClient:
         limmag = float(c.get("diffmaglim", mag + 1.0))
 
         cand_id = str(c.get("candid", "")).strip()
-        internal_name = f"{objid}_{cand_id}" if cand_id else objid
+        internal_name = self._build_internal_name(objid, cand_id)
 
         discovery_dt = _fmt_tns_dt(jd_to_datetime_utc(jd))
 
@@ -381,7 +413,7 @@ class TNSClient:
 
         at_entry: Dict[str, Any] = {
             "internal_name": internal_name,
-            "reporter": self.reporter,
+            "reporter": rep,
             "ra": {"value": f"{ra:.6f}"},
             "dec": {"value": f"{dec:.6f}"},
             "discovery_datetime": discovery_dt,
@@ -507,7 +539,7 @@ class TNSClient:
         if not self.nondet_filter_value:
             warnings.append("TNS_NONDET_FILTER_VALUE is empty (will omit non_detection.filter_value; set a real filter ID).")
         if not self.reporter:
-            warnings.append("TNS_REPORTER is empty (will fallback to 'Firstlight').")
+            warnings.append("TNS_REPORTER_NAME is empty (payload building will fail; set it explicitly).")
 
         d = {
             "api_base_url": self.api_base_url,
@@ -525,7 +557,7 @@ class TNSClient:
                 f"instrumentid={self.instrumentid!r} "
                 f"phot_flux_units={self.photometry_flux_units!r} nondet_flux_units={self.nondet_flux_units!r} "
                 f"phot_filterid={self.photometry_filterid!r} nondet_filter_value={self.nondet_filter_value!r} "
-                f"reporter={self.reporter!r}"
+                f"reporter={self.reporter!r} internal_name_prefix={self.internal_name_prefix!r} internal_name_mode={self.internal_name_mode!r}"
             ),
             "warnings": warnings,
         }
@@ -606,9 +638,9 @@ class TNSClient:
         )
 
         http_attempts = [a for a in attempts if a.http != 0]
-        all401 = bool(http_attempts) and all(a.http == 401 for a in http_attempts)
+        all_auth_fatal = bool(http_attempts) and all(a.http in (401, 403) for a in http_attempts)
         flags: List[str] = []
-        if all401:
+        if all_auth_fatal:
             flags.append("fatal=auth")
 
         status = "ok" if best.ok else "failed"
@@ -701,20 +733,23 @@ class TNSClient:
         while True:
             tries += 1
             attempts = one_round(self.reply_url)
-            if all(a.http == 401 for a in attempts):
+            http_attempts0 = [a for a in attempts if a.http != 0]
+            all_auth0 = bool(http_attempts0) and all(a.http in (401, 403) for a in http_attempts0)
+            if all_auth0:
                 attempts += one_round(self.reply_url_alt)
 
-            all401 = all(a.http == 401 for a in attempts)
+            http_attempts = [a for a in attempts if a.http != 0]
+            all_auth = bool(http_attempts) and all(a.http in (401, 403) for a in http_attempts)
 
             best = next((a for a in attempts if a.http == 200 and isinstance(a.raw_json, dict)), None)
             if best is None:
                 non401 = [a for a in attempts if a.http != 401]
                 best = non401[0] if non401 else attempts[0]
 
-            if all401:
+            if all_auth:
                 summary = " | ".join([f"{a.method}:{a.http}:{a.id_code}:{a.id_message}" for a in attempts])
                 detail = (
-                    f"via={best.method} http=401 elapsed_ms={best.elapsed_ms} "
+                    f"via={best.method} http={best.http} elapsed_ms={best.elapsed_ms} "
                     f"id_code={best.id_code} id_message={best.id_message} tries={tries} fatal=auth "
                     f"({summary}) [{_stats_api_key(self.api_key)} {_stats_ua(self.user_agent)}]"
                 )
