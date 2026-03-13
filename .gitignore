@@ -30,3 +30,12 @@ scripts/db_max.py
 # Runtime data / logs
 alertDB/raw/
 alertDB/logs/
+
+*.sqlite
+*.sqlite.old
+*.sqlite-shm
+*.sqlite-wal
+*.db
+.env
+.env.*
+!config/*.example.env

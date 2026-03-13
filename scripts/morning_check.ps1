@@ -6,7 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\scripts\morning_check.ps1 -PythonExe .\.venv\Scripts\python.exe
 
 param(
-  [string]$Db = ".\firstlight.sqlite",
+  [string]$Db = ".\firstlight_prod.sqlite",
   [string]$LogsRoot = ".\alertDB\logs",
   [string]$RawRoot  = ".\alertDB\raw",
   [int]$Tail = 25,
