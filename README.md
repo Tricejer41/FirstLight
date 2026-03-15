@@ -1,118 +1,190 @@
-# Firstlight N1 — low-latency “first report” pipeline (Fink → TNS)
+# FirstLight
 
-This repo is a **template** to run a near-real-time pipeline:
-Fink livestream → normalize → N1 filter → minimal vetting → anti-duplicate checks → (optional) TNS report → logging/auditing.
+**FirstLight** is a low-latency, auditable transient triage pipeline built on public alert streams to identify, report and prioritize high-value **hostless** candidates for follow-up.
 
-It is intentionally **small and hackable**. The only hard dependency is `fink-client`.
-TNS submission is provided as a pluggable module (stub by default) because credentials + endpoint details vary.
+The current public focus of the project is:
 
-## Quick start (Windows / PowerShell)
+- real-time ingestion of public Fink/ZTF alerts
+- normalization + niche filtering for hostless candidates
+- anti-duplication and TNS reporting
+- SQLite-backed auditing and reproducibility
+- transition from pure first-report automation to **follow-up prioritization**
 
-1) Create & activate venv
+## Current status
+
+- public repository sanitized and aligned with the production workflow
+- first successful **production** TNS report achieved
+- nightly capped reporting validated
+- next milestone: prioritization of hostless candidates for independent follow-up and eventual classification
+
+## Why this project exists
+
+Modern public alert streams produce more transient candidates than a single observer can realistically follow.
+
+FirstLight is not meant to maximize the number of reports.  
+Its goal is to:
+
+1. identify a small number of high-value hostless candidates in real time
+2. report them with traceability
+3. prioritize the subset that is realistically followable and classifiable with limited independent resources
+
+## High-level architecture
+
+FirstLight currently operates as:
+
+`Fink alert stream -> AVRO capture -> replay/normalization -> niche filter -> SQLite decisions -> TNS dispatch -> auditing`
+
+Core design principles:
+
+- **low latency**
+- **auditability**
+- **replayability**
+- **small operational footprint**
+- **clear separation between discovery/reporting and follow-up prioritization**
+
+## Repository structure
+
+```text
+FirstLight/
+  config/
+    n1.example.yaml
+    tns.example.env
+
+  scripts/
+    run_night.ps1
+    run_night_wrapper.ps1
+    replay_avro_dir.py
+    morning_check.ps1
+    sweep_replies_once.ps1
+
+  src/firstlight/
+    __init__.py
+    __main__.py
+    cli.py
+    niches/
+      n1_hostless_fast.py
+    pipeline/
+      normalize.py
+    storage/
+      db.py
+    tns/
+      client.py
+      dispatch.py
+    utils/
+      time.py
+
+  deploy/windows/
+    task.example.xml
+
+  legacy/
+    ...older or non-production paths kept for reference only
+```
+
+## What is considered production-relevant
+
+The current production-oriented workflow relies mainly on:
+
+- `scripts/run_night.ps1`
+- `scripts/replay_avro_dir.py`
+- `scripts/morning_check.ps1`
+- `src/firstlight/cli.py`
+- `src/firstlight/storage/db.py`
+- `src/firstlight/tns/client.py`
+- `src/firstlight/tns/dispatch.py`
+- `src/firstlight/pipeline/normalize.py`
+- `src/firstlight/niches/n1_hostless_fast.py`
+
+## Environment and configuration
+
+Two example config files are included:
+
+- `config/n1.example.yaml`
+- `config/tns.example.env`
+
+Sensitive runtime files such as local databases, `.env.prod`, logs, and operational artifacts are intentionally excluded from version control.
+
+## TNS notes
+
+The project supports TNS-related actions from the CLI, including:
+
+- environment checks
+- payload inspection
+- minimal payload printing
+- report reply polling
+- capped dispatch from the local SQLite database
+
+Example:
+
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m firstlight --env .env.prod tns envcheck
+python -m firstlight --env .env.prod tns submit-min --print-payload
 ```
 
-2) Make sure you can poll from Fink (you already tested):
+## Nightly operation
+
+Typical production-oriented usage is based on the nightly runner:
+
 ```powershell
-fink_consumer --display -limit 1
+& .\scripts\run_night.ps1 `
+  -MaxHours 10 `
+  -EnvFile .env.prod `
+  -CfgPath .\config\n1.example.yaml `
+  -DbPath .\firstlight_prod.sqlite `
+  -PythonExe C:\path\to\python.exe `
+  -FinkConsumerExe C:\path\to\fink_consumer.exe `
+  -DispatchMaxSubmit 1 `
+  -DispatchSkipReply:$true
 ```
 
-3) (Recommended) Reset offsets to start *from now* (avoid 4 days backlog):
+A quick morning review can be done with:
+
 ```powershell
-fink_consumer --display -start_at latest -limit 1
+.\scripts\morning_check.ps1 -Db .\firstlight_prod.sqlite
 ```
 
-4) Run the pipeline in **dry-run** (no TNS submission)
-```powershell
-python -m firstlight run --topics fink_new_hostless_ztf fink_intra_night_hostless_ztf fink_inter_night_hostless_ztf --dry-run
-```
+## Roadmap
 
-5) When ready, configure TNS credentials (see `config/tns.example.env`) and run:
-```powershell
-python -m firstlight run --topics fink_new_hostless_ztf fink_intra_night_hostless_ztf fink_inter_night_hostless_ztf
-```
+The current roadmap is:
 
-## Where things live
+1. keep the hostless discovery/reporting workflow stable
+2. add a follow-up prioritization layer within the hostless niche
+3. track which submitted candidates are realistically classifiable
+4. build a small, well-documented set of follow-up outcomes
+5. transition from reporting infrastructure to a scientifically defensible follow-up selection story
 
-- `src/firstlight/ingest/fink_stream.py` consumes alerts with `fink_client.consumer.AlertConsumer`.
-- `src/firstlight/niches/n1_hostless_fast.py` is **the N1 filter** (edit thresholds here).
-- `src/firstlight/tns/` contains anti-duplicate checks + TNS submission stub.
-- `firstlight.sqlite` (created on first run) stores audit logs + decisions.
+## What this repository is not
 
-## Notes
+This is **not** a polished general-purpose astronomy platform, and it is **not yet** a full automated classification system.
 
-- Cutouts are stored in the alert packet as gzipped FITS bytes. We do not depend on `astropy`.
-- Anti-duplicate check uses:
-  - your own DB (never re-send the same objectId), and
-  - Fink Portal resolver (ZTF → TNS reverse lookup) when available.
+It is an independent, evolving project focused on:
 
+- operational reliability
+- transparent candidate selection
+- realistic progression toward classification-oriented follow-up
 
-## TNS endpoint probe
+## Personal note
 
-Run:
+FirstLight is an **independent personal project**, developed outside my day job and outside any official employer scope.
 
-```bash
-python -m firstlight --env .env tns probe
-```
+It sits at the intersection of:
+- software engineering
+- real-time data pipelines
+- personal work in astrophysics / time-domain astronomy
 
-If `submit_url` is None, keep `--dry-run` and extend endpoint candidates in `src/firstlight/tns/client.py`.
+## Public communication policy
 
-### TNS endpoints (TNS 2.0)
+The project is communicated publicly by milestones, not by nightly noise.
 
-This project uses:
-- submit: `/api/set/bulk-report`
-- reply: `/api/get/bulk-report-reply`
+The current public milestone is:
+- first successful production TNS report
+- repository cleanup and public documentation alignment
+- transition toward hostless follow-up prioritization
 
+## License / publication
 
+A formal publication path will only make sense once the follow-up prioritization layer is frozen and evaluated on real cases with documented outcomes.
 
-# Night runner (ingesta nocturna)
-
-## Qué ejecuta
-La tarea programada **FirstLight Night Runner** lanza `scripts/run_night_wrapper.ps1` (PowerShell).
-
-El wrapper:
-- fuerza logs en `C:\ProgramData\FirstLight\logs\scheduler\`
-- lanza `scripts/run_night.ps1` con:
-  - `PythonExe` y `FinkConsumerExe` absolutos (del venv)
-  - `MaxHours` (duración máxima del run)
-
-`run_night.ps1` lanza 3 procesos en paralelo:
-1) **fink_consumer**  
-   Guarda ficheros `.avro` en:
-   - `alertDB/raw/<RUN>/`
-
-2) **replay watcher** (`scripts/replay_avro_dir.py --follow`)  
-   Vigila el directorio raw y por cada `.avro`:
-   - normaliza el alert
-   - aplica el filtro N1
-   - inserta en SQLite:
-     - `alerts` (raw_json)
-     - `decisions` (passed/reason/metrics_json)
-   Además escribe auditoría en:
-   - `alertDB/logs/<RUN>/replay.jsonl`
-
-3) **dispatch loop** (`scripts/dispatch_loop.ps1`)  
-   Cada `EveryS` segundos:
-   - consulta decisiones recientes en SQLite
-   - intenta enviar al sandbox TNS (o dry-run)
-   - registra en:
-     - `alertDB/logs/<RUN>/dispatch.out.log`
-
-## Estructura de directorios
-- `alertDB/raw/<RUN>/` : AVRO descargados por `fink_consumer`
-- `alertDB/logs/<RUN>/` : logs por proceso (consumer/replay/dispatch)
-- `C:\ProgramData\FirstLight\logs\scheduler\` : logs del scheduler (wrapper)
-
-## Cómo monitorizar
-- Ver último run del scheduler:
-  - `dir C:\ProgramData\FirstLight\logs\scheduler | sort LastWriteTime -Descending | select -First 5`
-- Ver el run actual (RUN=...):
-  - `Get-Content <night_*.out.log> -Tail 50`
-- Ver si SQLite se llena:
-  - `python -c "import sqlite3; c=sqlite3.connect('firstlight.sqlite'); print(c.execute('select count(*) from alerts').fetchone()[0])"`
-
-## Cómo parar
-- `schtasks /End /TN "FirstLight Night Runner"`
+Until then, the repository should be read as:
+- a real working system
+- with a validated first production stage
+- and an explicitly defined next scientific stage

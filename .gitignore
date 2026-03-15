@@ -1,4 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -9,15 +9,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-firstlight.sqlite
-alertDB/
-secrets/
-.env
-_salvage_client.py
-scripts/db_check.py
-scripts/db_max.py
+
 # Local runtime databases
 *.sqlite
+*.sqlite.old
 *.sqlite-shm
 *.sqlite-wal
 *.db
@@ -28,14 +23,12 @@ scripts/db_max.py
 !config/*.example.env
 
 # Runtime data / logs
+alertDB/
 alertDB/raw/
 alertDB/logs/
 
-*.sqlite
-*.sqlite.old
-*.sqlite-shm
-*.sqlite-wal
-*.db
-.env
-.env.*
-!config/*.example.env
+# Local secrets / helpers not meant for public repo
+secrets/
+_salvage_client.py
+scripts/db_check.py
+scripts/db_max.py
