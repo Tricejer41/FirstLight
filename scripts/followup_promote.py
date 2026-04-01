@@ -12,14 +12,13 @@ PROMOTION_PROFILE = {
     "watch_high_min": 78.0,
     "promote_photometry_min": 85.0,
     "promote_spectroscopy_min": 90.0,
-    "promote_min_scores": 2,
     "promote_spectroscopy_max_mag": 17.2,
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Apply initial follow-up status promotion rules from dynamic scores."
+        description="Apply evidence-aware promotion rules to follow-up queue."
     )
     parser.add_argument(
         "--db",
@@ -58,52 +57,69 @@ def ensure_tables_exist(con: sqlite3.Connection) -> None:
         )
 
 
+def fetch_latest_score_row(con: sqlite3.Connection, object_id: str, candid: str) -> sqlite3.Row | None:
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    row = cur.execute(
+        """
+        SELECT
+            score_id,
+            object_id,
+            candid,
+            score_utc,
+            score_version,
+            total_score,
+            current_mag,
+            score_breakdown_json
+        FROM followup_score_history
+        WHERE object_id = ?
+          AND candid = ?
+        ORDER BY score_utc DESC, score_id DESC
+        LIMIT 1
+        """,
+        (object_id, candid),
+    ).fetchone()
+    return row
+
+
 def fetch_queue_rows(con: sqlite3.Connection) -> list[sqlite3.Row]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     rows = cur.execute(
         """
         SELECT
-            fq.queue_id,
-            fq.object_id,
-            fq.candid,
-            fq.report_id,
-            fq.tns_name,
-            fq.status,
-            fq.priority_bucket,
-            fq.current_score,
-            fq.best_score,
-            fq.external_classification,
-            fq.external_classification_label,
-            (
-                SELECT COUNT(*)
-                FROM followup_score_history sh
-                WHERE sh.object_id = fq.object_id
-                  AND sh.candid = fq.candid
-            ) AS score_count,
-            (
-                SELECT sh.current_mag
-                FROM followup_score_history sh
-                WHERE sh.object_id = fq.object_id
-                  AND sh.candid = fq.candid
-                ORDER BY sh.score_utc DESC, sh.score_id DESC
-                LIMIT 1
-            ) AS current_mag
-        FROM followup_queue fq
-        WHERE fq.status NOT IN ('classified', 'classified_by_others', 'dropped')
-          AND fq.current_score IS NOT NULL
-        ORDER BY fq.current_score DESC, fq.best_score DESC
+            queue_id,
+            object_id,
+            candid,
+            report_id,
+            tns_name,
+            status,
+            priority_bucket,
+            current_score,
+            best_score,
+            external_classification,
+            external_classification_label
+        FROM followup_queue
+        WHERE status NOT IN ('classified', 'classified_by_others', 'dropped')
+          AND current_score IS NOT NULL
+        ORDER BY current_score DESC, best_score DESC
         """
     ).fetchall()
     return rows
 
 
-def classify_target_status(row: sqlite3.Row) -> tuple[str, str, int, str | None]:
-    score = float(row["current_score"])
-    score_count = int(row["score_count"] or 0)
-    current_mag = row["current_mag"]
+def classify_target_status(queue_row: sqlite3.Row, score_row: sqlite3.Row) -> tuple[str, str, int, str]:
+    score = float(score_row["total_score"])
+    current_mag = score_row["current_mag"]
     current_mag = float(current_mag) if current_mag is not None else None
-    external_classification = int(row["external_classification"] or 0)
+
+    payload = json.loads(score_row["score_breakdown_json"])
+    evidence = payload.get("evidence", {})
+    survey_evidence = int(evidence.get("survey_evidence_epoch_count", 0))
+    manual_phot = int(evidence.get("manual_phot_evidence_count", 0))
+    effective = int(evidence.get("effective_evidence_count", 0))
+
+    external_classification = int(queue_row["external_classification"] or 0)
 
     if external_classification == 1:
         return (
@@ -115,29 +131,31 @@ def classify_target_status(row: sqlite3.Row) -> tuple[str, str, int, str | None]
 
     if (
         score >= PROMOTION_PROFILE["promote_spectroscopy_min"]
-        and score_count >= PROMOTION_PROFILE["promote_min_scores"]
         and current_mag is not None
         and current_mag <= PROMOTION_PROFILE["promote_spectroscopy_max_mag"]
+        and effective >= 1
     ):
         return (
             "promote_spectroscopy",
             "urgent",
             1,
             (
-                f"score={score:.1f} score_count={score_count} "
-                f"current_mag={current_mag:.3f} meets spectroscopy trigger"
+                f"score={score:.1f} current_mag={current_mag:.3f} "
+                f"survey_evidence={survey_evidence} manual_phot={manual_phot} "
+                f"effective_evidence={effective} meets spectroscopy trigger"
             ),
         )
 
-    if (
-        score >= PROMOTION_PROFILE["promote_photometry_min"]
-        and score_count >= PROMOTION_PROFILE["promote_min_scores"]
-    ):
+    if score >= PROMOTION_PROFILE["promote_photometry_min"] and effective >= 1:
         return (
             "promote_photometry",
             "high",
             1,
-            f"score={score:.1f} score_count={score_count} meets photometry trigger",
+            (
+                f"score={score:.1f} survey_evidence={survey_evidence} "
+                f"manual_phot={manual_phot} effective_evidence={effective} "
+                f"meets photometry trigger"
+            ),
         )
 
     if score >= PROMOTION_PROFILE["watch_high_min"]:
@@ -145,20 +163,29 @@ def classify_target_status(row: sqlite3.Row) -> tuple[str, str, int, str | None]
             "watch_high",
             "high",
             0,
-            f"score={score:.1f} meets watch_high threshold",
+            (
+                f"score={score:.1f} survey_evidence={survey_evidence} "
+                f"manual_phot={manual_phot} effective_evidence={effective} "
+                f"meets watch_high threshold"
+            ),
         )
 
     return (
         "watch",
         "normal",
         0,
-        f"score={score:.1f} below watch_high threshold",
+        (
+            f"score={score:.1f} survey_evidence={survey_evidence} "
+            f"manual_phot={manual_phot} effective_evidence={effective} "
+            f"below watch_high threshold"
+        ),
     )
 
 
 def insert_action(
     con: sqlite3.Connection,
-    row: sqlite3.Row,
+    queue_row: sqlite3.Row,
+    score_row: sqlite3.Row,
     action_utc: str,
     action_type: str,
     old_status: str,
@@ -166,14 +193,16 @@ def insert_action(
     action_reason: str,
 ) -> None:
     payload = {
-        "current_score": row["current_score"],
-        "best_score": row["best_score"],
-        "score_count": row["score_count"],
-        "current_mag": row["current_mag"],
+        "current_score": score_row["total_score"],
+        "best_score": queue_row["best_score"],
+        "current_mag": score_row["current_mag"],
+        "report_id": queue_row["report_id"],
+        "tns_name": queue_row["tns_name"],
         "promotion_profile": PROMOTION_PROFILE,
-        "report_id": row["report_id"],
-        "tns_name": row["tns_name"],
+        "score_version": score_row["score_version"],
+        "score_breakdown_json": json.loads(score_row["score_breakdown_json"]),
     }
+
     cur = con.cursor()
     cur.execute(
         """
@@ -191,8 +220,8 @@ def insert_action(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            row["object_id"],
-            row["candid"],
+            queue_row["object_id"],
+            queue_row["candid"],
             action_utc,
             "system",
             action_type,
@@ -206,12 +235,12 @@ def insert_action(
 
 def update_queue_status(
     con: sqlite3.Connection,
-    row: sqlite3.Row,
+    queue_row: sqlite3.Row,
     new_status: str,
     new_priority: str,
     promotion_triggered: int,
     action_utc: str,
-    action_reason: str | None,
+    action_reason: str,
 ) -> None:
     cur = con.cursor()
 
@@ -236,7 +265,7 @@ def update_queue_status(
             promotion_utc,
             promotion_reason,
             action_utc,
-            row["queue_id"],
+            queue_row["queue_id"],
         ),
     )
 
@@ -251,36 +280,42 @@ def main() -> int:
     con = sqlite3.connect(db_path)
     try:
         ensure_tables_exist(con)
-        rows = fetch_queue_rows(con)
-        print(f"queue_rows_with_scores={len(rows)}")
+        queue_rows = fetch_queue_rows(con)
+        print(f"queue_rows_with_scores={len(queue_rows)}")
 
         action_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         changed = 0
         unchanged = 0
         preview_lines: list[str] = []
 
-        for row in rows:
-            old_status = row["status"]
-            old_priority = row["priority_bucket"]
+        for queue_row in queue_rows:
+            score_row = fetch_latest_score_row(con, queue_row["object_id"], queue_row["candid"])
+            if score_row is None:
+                unchanged += 1
+                continue
 
-            new_status, new_priority, promotion_triggered, action_reason = classify_target_status(row)
+            old_status = queue_row["status"]
+            old_priority = queue_row["priority_bucket"]
+
+            new_status, new_priority, promotion_triggered, action_reason = classify_target_status(
+                queue_row, score_row
+            )
 
             will_change = (new_status != old_status) or (new_priority != old_priority)
 
             if will_change:
                 changed += 1
                 preview_lines.append(
-                    f"CHANGE object_id={row['object_id']} candid={row['candid']} "
+                    f"CHANGE object_id={queue_row['object_id']} candid={queue_row['candid']} "
                     f"{old_status}/{old_priority} -> {new_status}/{new_priority} "
-                    f"score={float(row['current_score']):.1f} count={int(row['score_count'] or 0)} "
-                    f"mag={row['current_mag']}"
+                    f"score={float(score_row['total_score']):.1f} mag={score_row['current_mag']}"
                 )
 
                 if not args.dry_run:
                     action_type = "promote" if new_status.startswith("promote_") else "status_change"
                     update_queue_status(
                         con,
-                        row,
+                        queue_row,
                         new_status,
                         new_priority,
                         promotion_triggered,
@@ -289,12 +324,13 @@ def main() -> int:
                     )
                     insert_action(
                         con,
-                        row,
+                        queue_row,
+                        score_row,
                         action_utc,
                         action_type,
                         old_status,
                         new_status,
-                        action_reason or "",
+                        action_reason,
                     )
             else:
                 unchanged += 1
