@@ -435,7 +435,7 @@ function Run-DispatchOnce(
     $capReached = $true
     $capDetail = 'CAP_REACHED'
   }
-  if ($tailText -match 'detail=(cap reached:[^\r\n]+)') {
+  if ($tailText -match 'detail=(cap reached[^\r\n]+)') {
     $capReached = $true
     $capDetail = $Matches[1]
   }
