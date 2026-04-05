@@ -314,6 +314,7 @@ Rotate-LogIfNeeded $replayJsonl $RotateMaxMB $RotateKeep
 "DispatchTopic=$DispatchTopic"           | Add-Content -Path $meta -Encoding utf8
 "PythonExe=$PythonExe"                   | Add-Content -Path $meta -Encoding utf8
 "FinkConsumerExe=$FinkConsumerExe"       | Add-Content -Path $meta -Encoding utf8
+"DispatchDisableOnCap=True"              | Add-Content -Path $meta -Encoding utf8
 
 Append-Log $dispatchOut "run started"
 Append-Log $dispatchErr "run started"
@@ -469,6 +470,9 @@ Write-Host ("Running until {0}" -f $until)
 
 $nextDispatch = Get-Date
 $dispatchBackoffS = [Math]::Max(10, $DispatchFailBackoffStartS)
+$dispatchDisabled = $false
+$dispatchDisabledMsg = $null
+$dispatchDisabledAt = $null
 
 $stopMsg = $null
 $backoffConsumer = 5
@@ -505,7 +509,7 @@ try {
       $backoffReplay = 5
     }
 
-    if ((Get-Date) -ge $nextDispatch) {
+    if ((Get-Date) -ge $nextDispatch -and -not $dispatchDisabled) {
       $res = $null
       try {
         $res = Run-DispatchOnce `
@@ -537,13 +541,20 @@ try {
         }
 
         if ($res.CapReached) {
+          $dispatchDisabled = $true
+          $dispatchDisabledAt = $now
+
           if ([string]::IsNullOrWhiteSpace($res.CapDetail)) {
-            $stopMsg = ("MAX SUBMIT reached ({0}) at {1}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"))
+            $dispatchDisabledMsg = ("DISPATCH DISABLED after submit cap ({0}) at {1}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"))
           } else {
-            $stopMsg = ("MAX SUBMIT reached ({0}) at {1} :: {2}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"), $res.CapDetail)
+            $dispatchDisabledMsg = ("DISPATCH DISABLED after submit cap ({0}) at {1} :: {2}" -f $DispatchMaxSubmit, $now.ToString("yyyy-MM-dd HH:mm:ss"), $res.CapDetail)
           }
-          Append-Log $dispatchOut $stopMsg
-          break
+
+          Append-Log $dispatchOut $dispatchDisabledMsg
+
+          # No más intentos de dispatch esta noche, pero seguimos consumiendo/replay hasta MaxHours
+          $nextDispatch = $until.AddYears(1)
+          continue
         }
 
         if ($res.TimedOut -or ($res.ExitCode -ne "0" -and $res.ExitCode -ne $null)) {
@@ -567,7 +578,11 @@ try {
   }
 
   if (-not $stopMsg) {
-    $stopMsg = ("TIME LIMIT reached ({0})" -f $until)
+    if ($dispatchDisabledMsg) {
+      $stopMsg = ("TIME LIMIT reached ({0}) :: {1}" -f $until, $dispatchDisabledMsg)
+    } else {
+      $stopMsg = ("TIME LIMIT reached ({0})" -f $until)
+    }
   }
 
 } finally {
