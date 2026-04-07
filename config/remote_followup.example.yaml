@@ -1,0 +1,35 @@
+ranking:
+  keep_top_watch_high: 5
+  max_daily_primary: 1
+  max_daily_backup: 1
+
+imaging:
+  preferred_mag_max: 17.8
+  acceptable_mag_max: 18.5
+  freshness_days_max: 2.0
+  min_score_backup: 72
+  min_score_now: 82
+
+spectroscopy:
+  preferred_mag_max: 17.2
+  hard_mag_max: 17.8
+  min_score_ready: 88
+  min_effective_evidence: 1
+  require_manual_imaging_first: true
+
+geometry_proxy:
+  use_declination_penalty: true
+  declination_soft_min_deg: -20
+  declination_hard_min_deg: -35
+
+manual_review:
+  allow_manual_primary_override: true
+  allow_manual_backup_override: true
+  require_reason_on_manual_override: true
+
+states:
+  shortlist_status: watch_high
+  backup_status: actionable_backup
+  primary_status: actionable_now
+  spectroscopy_status: ready_spectroscopy
+  closed_status: closed
