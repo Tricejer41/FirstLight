@@ -157,8 +157,8 @@ class TNSClient:
 
         # IMPORTANT: do NOT guess IDs. Empty => field omitted, reply will say "Required field" if needed.
         self.reporting_groupid = _env("TNS_REPORTING_GROUPID", "")
-        self.discovery_data_sourceid = _env("TNS_DISCOVERY_DATA_SOURCEID", "1")  # kept as before; no error yet
-        self.instrumentid = _env("TNS_INSTRUMENTID", "1")  # kept as before; no error yet
+        self.discovery_data_sourceid = _env("TNS_DISCOVERY_DATA_SOURCEID", "")
+        self.instrumentid = _env("TNS_INSTRUMENTID", "")
 
         self.photometry_flux_units = _env("TNS_PHOT_FLUX_UNITS", "1")   # previously accepted
         self.nondet_flux_units = _env("TNS_NONDET_FLUX_UNITS", "1")     # previously accepted
@@ -279,7 +279,24 @@ class TNSClient:
         rep = (self.reporter or "").strip()
         if not rep:
             raise RuntimeError("Missing required env var: TNS_REPORTER_NAME (needed for TNS payload field 'reporter').")
+
+        rep_lower = rep.lower()
+        if "et al." in rep_lower or rep_lower.endswith("et al") or " et al" in rep_lower:
+            raise RuntimeError("TNS_REPORTER_NAME/TNS_REPORTER must not contain 'et al.'; use only names or optionally 'on behalf of ...'.")
+
         return rep
+
+    def _require_discovery_data_sourceid(self) -> str:
+        v = (self.discovery_data_sourceid or "").strip()
+        if not v:
+            raise RuntimeError("Missing required env var: TNS_DISCOVERY_DATA_SOURCEID (set it to the real TNS ID for ZTF before submitting production reports).")
+        return v
+
+    def _require_instrumentid(self) -> str:
+        v = (self.instrumentid or "").strip()
+        if not v:
+            raise RuntimeError("Missing required env var: TNS_INSTRUMENTID (for ZTF-Cam use 196).")
+        return v
 
 
     def _build_internal_name(self, objid: str, cand_id: Optional[str] = None) -> str:
@@ -298,6 +315,8 @@ class TNSClient:
 
     def build_submit_min_payload(self) -> Dict[str, Any]:
         rep = self._require_reporter()
+        discovery_data_sourceid = self._require_discovery_data_sourceid()
+        instrumentid = self._require_instrumentid()
         discovery_dt = _utc_now_str_ms()
         nondet_dt = _utc_str_ms_offset(-86400)
         test_prefix = (self.internal_name_prefix or "ZTFTEST").strip()
@@ -318,8 +337,7 @@ class TNSClient:
 
         if self.reporting_groupid:
             at_entry["reporting_groupid"] = str(self.reporting_groupid)
-        if self.discovery_data_sourceid:
-            at_entry["discovery_data_sourceid"] = str(self.discovery_data_sourceid)
+        at_entry["discovery_data_sourceid"] = str(discovery_data_sourceid)
 
         phot0: Dict[str, Any] = {
             "obsdate": discovery_dt,
@@ -328,8 +346,7 @@ class TNSClient:
             "flux_units": str(self.photometry_flux_units),
             "remarks": "discovery point (sandbox submit-min)",
         }
-        if self.instrumentid:
-            phot0["instrumentid"] = str(self.instrumentid)
+        phot0["instrumentid"] = str(instrumentid)
 
         phot_filterid, _ = _choose_filter_ids(2, self.photometry_filterid or "auto", self.nondet_filter_value or "auto")
         if phot_filterid:
@@ -344,8 +361,7 @@ class TNSClient:
             "flux_units": str(self.nondet_flux_units),
             "remarks": "placeholder non-detection (schema convergence)",
         }
-        if self.instrumentid:
-            nd["instrument_value"] = str(self.instrumentid)
+        nd["instrument_value"] = str(instrumentid)
 
         _, nd_filter = _choose_filter_ids(2, self.photometry_filterid or "auto", self.nondet_filter_value or "auto")
         if nd_filter:
@@ -356,6 +372,8 @@ class TNSClient:
 
     def build_at_report_from_fink_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         rep = self._require_reporter()
+        discovery_data_sourceid = self._require_discovery_data_sourceid()
+        instrumentid = self._require_instrumentid()
         if not isinstance(payload, dict):
             raise ValueError("payload must be dict")
         if "objectId" not in payload or "candidate" not in payload:
@@ -423,8 +441,7 @@ class TNSClient:
 
         if self.reporting_groupid:
             at_entry["reporting_groupid"] = str(self.reporting_groupid)
-        if self.discovery_data_sourceid:
-            at_entry["discovery_data_sourceid"] = str(self.discovery_data_sourceid)
+        at_entry["discovery_data_sourceid"] = str(discovery_data_sourceid)
 
         phot0: Dict[str, Any] = {
             "obsdate": discovery_dt,
@@ -433,8 +450,7 @@ class TNSClient:
             "flux_units": str(self.photometry_flux_units),
             "remarks": "discovery photometry (ZTF magpsf)",
         }
-        if self.instrumentid:
-            phot0["instrumentid"] = str(self.instrumentid)
+        phot0["instrumentid"] = str(instrumentid)
         if phot_filterid:
             phot0["filterid"] = str(phot_filterid)
 
@@ -447,8 +463,7 @@ class TNSClient:
             "flux_units": str(self.nondet_flux_units),
             "remarks": "last non-detection (fallback if broker lacks prv_candidates)",
         }
-        if self.instrumentid:
-            nd["instrument_value"] = str(self.instrumentid)
+        nd["instrument_value"] = str(instrumentid)
         if nondet_filter_value:
             nd["filter_value"] = str(nondet_filter_value)
 
@@ -533,13 +548,21 @@ class TNSClient:
     def envcheck_dict(self, show_ua: bool = False) -> Dict[str, Any]:
         warnings: List[str] = []
         if not self.reporting_groupid:
-            warnings.append("TNS_REPORTING_GROUPID is empty (will omit reporting_groupid; set a real group ID).")
+            warnings.append("TNS_REPORTING_GROUPID is empty (payload building will omit reporting_groupid; set a real group ID).")
+        if not self.discovery_data_sourceid:
+            warnings.append("TNS_DISCOVERY_DATA_SOURCEID is empty (payload building will fail; set the real TNS ID for ZTF).")
+        if not self.instrumentid:
+            warnings.append("TNS_INSTRUMENTID is empty (payload building will fail; for ZTF-Cam use 196).")
         if not self.photometry_filterid:
-            warnings.append("TNS_PHOT_FILTERID is empty (will omit photometry.filterid; set a real filter ID).")
+            warnings.append("TNS_PHOT_FILTERID is empty (auto mode will map ZTF fid to filter IDs 110/111/112).")
         if not self.nondet_filter_value:
-            warnings.append("TNS_NONDET_FILTER_VALUE is empty (will omit non_detection.filter_value; set a real filter ID).")
+            warnings.append("TNS_NONDET_FILTER_VALUE is empty (auto mode will map ZTF fid to filter IDs 110/111/112).")
         if not self.reporter:
             warnings.append("TNS_REPORTER_NAME is empty (payload building will fail; set it explicitly).")
+        else:
+            rep_lower = self.reporter.lower()
+            if "et al." in rep_lower or rep_lower.endswith("et al") or " et al" in rep_lower:
+                warnings.append("TNS_REPORTER_NAME/TNS_REPORTER contains 'et al.' which TNS asked to avoid for ADS indexing.")
 
         d = {
             "api_base_url": self.api_base_url,
