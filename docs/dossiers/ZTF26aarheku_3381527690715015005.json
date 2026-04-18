@@ -1,0 +1,206 @@
+{
+  "blockers": {
+    "backup": [
+      "score 62.0 below backup threshold 72.0",
+      "freshness 11.03 d above backup window 8.0 d"
+    ],
+    "primary": [
+      "score 62.0 below primary threshold 82.0",
+      "freshness 11.03 d above primary window 4.0 d"
+    ],
+    "spectroscopy": [
+      "remote spectroscopy score 56.2 below threshold 88.0",
+      "effective evidence 0 below required 1",
+      "manual imaging missing before spectroscopy"
+    ]
+  },
+  "candidate": {
+    "candid": "3381527690715015005",
+    "object_id": "ZTF26aarheku"
+  },
+  "generated_utc": "2026-04-18T03:05:37+00:00",
+  "latest_review_decision": null,
+  "manual_observations": [],
+  "manual_summary": {
+    "count_total": 0,
+    "failed_attempt_count": 0,
+    "imaging_detection_count": 0,
+    "imaging_nondetection_count": 0,
+    "latest_any": null,
+    "latest_detection": null,
+    "latest_failed_attempt": null,
+    "latest_nondetection": null,
+    "latest_spectroscopy_attempt": null,
+    "latest_spectroscopy_success": null,
+    "spectroscopy_attempt_count": 0,
+    "spectroscopy_success_count": 0
+  },
+  "post_observation_reviews": [],
+  "queue": {
+    "best_score": 87.0,
+    "candid": "3381527690715015005",
+    "current_score": 62.0,
+    "dropped_reason": null,
+    "external_classification": 0,
+    "external_classification_label": null,
+    "followup_owner": null,
+    "last_review_utc": "2026-04-06T12:57:44+00:00",
+    "last_score_utc": "2026-04-06T12:57:44+00:00",
+    "next_review_utc": "2026-04-07T00:57:44+00:00",
+    "notes": "backfilled from tns_actions submitted",
+    "object_id": "ZTF26aarheku",
+    "priority_bucket": "high",
+    "promotion_reason": null,
+    "promotion_triggered": 0,
+    "promotion_utc": null,
+    "queue_id": 25,
+    "report_id": "271233",
+    "status": "watch_high",
+    "submitted_utc": "2026-04-06T01:53:58+00:00",
+    "tns_name": null,
+    "topic": "fink"
+  },
+  "readiness": {
+    "level": "scientific_shortlist",
+    "summary": "The candidate remains on the scientific shortlist, but it still lacks enough evidence or freshness for the next escalation step."
+  },
+  "recent_actions": [
+    {
+      "action_reason": "score=87.0 remains in scientific shortlist",
+      "action_type": "status_change",
+      "action_utc": "2026-04-06T12:57:44+00:00",
+      "new_status": "watch_high",
+      "old_status": "watch",
+      "payload": {
+        "current_mag": 15.714037895202637,
+        "current_score": 87.0,
+        "days_since_nondet": 0.0073842997662723064,
+        "distpsnr1": 16.372602462768555,
+        "effective_evidence_count": 0,
+        "hours_above_threshold_dark": 0.0,
+        "manual_phot_evidence_count": 0,
+        "max_alt_dark_deg": -18.567027357843422,
+        "nmtchps": 2,
+        "observability_score": 0.0,
+        "promotion_profile": {
+          "actionable_backup_cap": 2,
+          "actionable_backup_max_days_since_nondet": 7.0,
+          "actionable_backup_max_mag": 17.5,
+          "actionable_backup_max_nmtchps": 2,
+          "actionable_backup_min_distpsnr1": 7.0,
+          "actionable_backup_min_evidence": 1,
+          "actionable_backup_min_hours_above": 0.75,
+          "actionable_backup_min_max_alt": 35.0,
+          "actionable_backup_min_obs_score": 5.0,
+          "actionable_backup_min_score": 88.0,
+          "actionable_now_cap": 3,
+          "actionable_now_max_days_since_nondet": 5.0,
+          "actionable_now_max_mag": 17.2,
+          "actionable_now_max_nmtchps": 2,
+          "actionable_now_min_distpsnr1": 10.0,
+          "actionable_now_min_evidence": 1,
+          "actionable_now_min_hours_above": 1.5,
+          "actionable_now_min_max_alt": 45.0,
+          "actionable_now_min_obs_score": 8.0,
+          "actionable_now_min_score": 90.0,
+          "actionable_now_min_srmag1": 21.0,
+          "watch_high_min": 78.0
+        },
+        "report_id": "271233",
+        "score_version": "classifiability_v2_observability",
+        "srmag1": -999.0,
+        "survey_evidence_epoch_count": 0,
+        "tns_name": null
+      }
+    }
+  ],
+  "score_history_tail": [
+    {
+      "score_utc": "2026-04-17T02:37:13+00:00",
+      "score_version": "classifiability_v3_remote_followup",
+      "total_score": 62.0
+    },
+    {
+      "score_utc": "2026-04-08T11:38:11+00:00",
+      "score_version": "classifiability_v3_remote_followup",
+      "total_score": 67.0
+    },
+    {
+      "score_utc": "2026-04-06T12:57:44+00:00",
+      "score_version": "classifiability_v2_observability",
+      "total_score": 87.0
+    }
+  ],
+  "score_snapshot": {
+    "age_since_submission_days": 11.030036080601851,
+    "components": {
+      "observability_score": 16.0,
+      "remote_bonus_score": 4.0,
+      "remote_imaging_feasibility_score": 16.0,
+      "remote_priority_score": 62.0,
+      "remote_spectroscopy_feasibility_score": 56.2,
+      "science_score": 42.0
+    },
+    "current_mag": 15.714037895202637,
+    "days_since_nondet": 11.030036080601851,
+    "distpsnr1": 16.372602462768555,
+    "effective_evidence_count": 0,
+    "effective_freshness_days": 11.030036080601851,
+    "manual_phot_evidence_count": 0,
+    "nmtchps": 2,
+    "remote_bonus_score": 4.0,
+    "remote_imaging_breakdown": {
+      "brightness_score": 10.0,
+      "declination_penalty": 0.0,
+      "freshness_score": 0.0,
+      "geometry_score": 6.0,
+      "survey_activity_score": 0.0
+    },
+    "remote_imaging_score": 16.0,
+    "remote_spectroscopy_breakdown": {
+      "brightness_score": 40.0,
+      "manual_imaging_score": 0.0,
+      "science_transfer_score": 16.2,
+      "survey_evidence_score": 0.0
+    },
+    "remote_spectroscopy_score": 56.2,
+    "science_breakdown": {
+      "brightness_score": 25.0,
+      "evolution_score": 4.0,
+      "field_cleanliness_score": 5.0,
+      "freshness_score": 0.0,
+      "hostless_cleanliness_score": 8.0,
+      "survey_evidence_score": 0.0
+    },
+    "science_score": 42.0,
+    "score_version": "classifiability_v3_remote_followup",
+    "srmag1": null,
+    "survey_evidence_epoch_count": 0,
+    "total_score": 62.0
+  },
+  "strategy_thresholds": {
+    "acceptable_mag_max": 18.5,
+    "backup_min_score": 72.0,
+    "preferred_mag_max": 17.8,
+    "primary_min_score": 82.0,
+    "shortlist_floor": 62.0,
+    "spectroscopy_hard_mag_max": 17.8,
+    "spectroscopy_min_effective_evidence": 1,
+    "spectroscopy_min_score": 88.0
+  },
+  "tns": {
+    "candid": "3381527690715015005",
+    "certificate_url": null,
+    "classification_status": "unknown",
+    "last_checked_utc": null,
+    "object_id": "ZTF26aarheku",
+    "public_utc": null,
+    "raw_reply_json": "{\"id_code\":200,\"id_message\":\"OK\",\"data\":{\"report_id\":271233}}",
+    "reply_status": "pending",
+    "report_id": "271233",
+    "submit_status": "submitted",
+    "submitted_utc": "2026-04-06T01:53:58+00:00",
+    "tns_name": null,
+    "tns_url": null
+  }
+}
