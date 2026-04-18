@@ -337,7 +337,7 @@ class TNSClient:
 
         if self.reporting_groupid:
             at_entry["reporting_groupid"] = str(self.reporting_groupid)
-        at_entry["discovery_data_sourceid"] = str(discovery_data_sourceid)
+        at_entry["data_source_groupid"] = str(discovery_data_sourceid)
 
         phot0: Dict[str, Any] = {
             "obsdate": discovery_dt,
@@ -441,7 +441,7 @@ class TNSClient:
 
         if self.reporting_groupid:
             at_entry["reporting_groupid"] = str(self.reporting_groupid)
-        at_entry["discovery_data_sourceid"] = str(discovery_data_sourceid)
+        at_entry["data_source_groupid"] = str(discovery_data_sourceid)
 
         phot0: Dict[str, Any] = {
             "obsdate": discovery_dt,
